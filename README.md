@@ -98,6 +98,46 @@ python verify_polymarket_access.py --limit 20 --min-volume 50000 --verbose
 > **Tidak dapet arb candidate itu normal dan expected** di scan pertama. Tujuan
 > Fase 0 cuma konfirmasi pipeline data jalan, bukan cari uang.
 
+## Phase 0 findings (penting — baca sebelum Phase 1)
+
+Run pertama Fase 0 mengembalikan 10 market, dan **semua 10 baris menunjukkan
+`yes_ask + no_ask = 1.001` persis**. Ini bukan kebetulan.
+
+**Interpretasi**: Polymarket CLOB pakai **tick size 0.001** ($0.001 / 0.1 sen).
+Market maker aktif mem-park order di floor minimum mereka, yaitu `fair + 1 tick`
+di kedua sisi. Akibatnya lantai natural `yes_ask + no_ask` di top-of-book adalah
+**1.001, bukan 1.000**. Di market dengan MM aktif, sum hampir tidak pernah
+turun ke ≤ 1.000 di best ask.
+
+**Implikasi untuk strategi Tipe 1 (YES + NO arb)**:
+
+- Arb Tipe 1 di top-of-book di market **liquid** ≈ nol peluang. MM enforce 1.001.
+- Arb Tipe 1 **hanya muncul** pada window spesifik:
+  1. Market baru listing, sebelum MM arrive (detik–menit)
+  2. Market illiquid yang MM tidak cover (tapi exit liquidity jadi masalah)
+  3. Fast move sepihak, satu sisi lag sesaat (kompetisi HFT)
+  4. Panic/whale dump event
+- Frekuensi-nya **belum diketahui empiris** — inilah yang harus Phase 1 ukur.
+
+**Keputusan**: tetap kejar Tipe 1 sebagai MVP, tapi dengan **ekspektasi realistis**.
+Phase 1 di-design untuk **mengukur empiris**:
+
+1. Seberapa sering `sum < 0.995` muncul dalam 24–72 jam polling?
+2. Di kategori market apa (politics, crypto, sports, culture)?
+3. Berapa lama jendela arb terbuka (latency matters)?
+4. Berapa size yang fillable di jendela itu?
+
+Kalau data Phase 1 bilang Tipe 1 terlalu jarang / terlalu kecil → pivot ke Tipe 2
+(sum-to-1 multi-outcome) yang MM **tidak enforce** karena butuh pair-matching
+lintas market. Pipeline client/discovery/snapshot 100% reusable — tidak ada
+kerja sia-sia.
+
+**Side finding**: sort by `volumeNum` descending di Gamma API mengembalikan
+market novelty dead-tail (Jesus return, LeBron president, Chelsea Clinton
+nomination) karena "volume kumulatif historis" ≠ "liquiditas aktif sekarang".
+Phase 1.2 (market discovery) akan ganti filter ke `liquidityNum` + `endDate`
+window + `yes_price ∈ [0.1, 0.9]` untuk hindari dead-tail.
+
 ## Catatan `fetch_data.py`
 
 Script ini dari iterasi awal — fetch OHLCV + ticker BTC dari Binance via ccxt.
