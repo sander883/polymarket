@@ -321,8 +321,7 @@ def print_table(discovered: list[DiscoveredMarket]) -> None:
         "id", "question", "cat", "ends", "liquidity",
         "y_ask", "n_ask", "sum", "edge", "fill_sz",
     ]
-    print(tabulate(rows, headers=headers, tablefmt="github",
-                   maxcolwidths=[10, 55, 12, 6, 12, 7, 7, 8, 8, 10]))
+    print(tabulate(rows, headers=headers, tablefmt="github"))
 
 
 def print_json(discovered: list[DiscoveredMarket]) -> None:
