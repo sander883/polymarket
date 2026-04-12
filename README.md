@@ -16,6 +16,8 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
   dataclasses). Read-only.
 - `market_discovery.py` — **Fase 1.2**: CLI market explorer. Two-stage pipeline:
   metadata filter (Gamma) → orderbook filter (CLOB). Outputs tabel atau JSON.
+- `snapshot.py` — **Fase 1.3**: capture orderbook snapshot → parquet. One file
+  per batch, stored under `data/snapshots/YYYY-MM-DD/`. DuckDB-queryable.
 - `verify_polymarket_access.py` — **Fase 0**: cek konektivitas Gamma + CLOB,
   dry-run deteksi Tipe 1 arb. Sekarang pakai `polymarket_client.py` di bawah.
 - `fetch_data.py` — utility lama, ambil OHLCV BTC/USDT dari Binance via ccxt
@@ -28,7 +30,7 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
 | 0     | Verifikasi akses Gamma + CLOB dari lokasi Anda | ✅ |
 | 1.1   | `polymarket_client.py` — async client foundation | ✅ |
 | 1.2   | `market_discovery.py` — smart market filter CLI | ✅ |
-| 1.3   | Orderbook snapshot + parquet storage | belum |
+| 1.3   | `snapshot.py` — orderbook snapshot + parquet storage | ✅ |
 | 1.4   | Poll loop service (overnight data collection) | belum |
 | 2     | Query explorer via DuckDB | belum |
 | 3     | Wallet + execution layer (paper + live behind flag) | belum |
@@ -220,6 +222,46 @@ python market_discovery.py -v
 ```
 
 Output sorted by edge descending (closest to arb first).
+
+## Phase 1.3: `snapshot.py`
+
+Captures orderbook snapshots to parquet. One file per batch, crash-safe (no
+in-memory buffer that can be lost).
+
+```bash
+# one-shot: discover → snapshot → parquet
+python snapshot.py
+
+# custom liquidity floor
+python snapshot.py --min-liquidity 100000 --target 50
+
+# custom output dir
+python snapshot.py --data-dir /tmp/poly-snapshots
+```
+
+Storage layout:
+
+```
+data/snapshots/
+  2026-04-12/
+    snap_143022.parquet    # 30 rows, ~15KB
+    snap_143527.parquet
+  2026-04-13/
+    ...
+```
+
+Query with DuckDB:
+
+```sql
+SELECT timestamp_ms, market_id, question, book_sum, edge
+FROM read_parquet('data/snapshots/**/*.parquet')
+WHERE edge > 0
+ORDER BY timestamp_ms;
+```
+
+Schema per row: `timestamp_ms`, `market_id`, `question`, `yes/no_best_bid/ask_price/size`,
+`yes/no_depth_5_ask/bid`, `book_sum`, `edge`, `fillable_size`, `days_remaining`, plus
+metadata (`condition_id`, `slug`, `category`, `end_date`, `liquidity`, `volume`).
 
 ## Catatan `fetch_data.py`
 
