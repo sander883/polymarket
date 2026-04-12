@@ -18,6 +18,8 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
   metadata filter (Gamma) → orderbook filter (CLOB). Outputs tabel atau JSON.
 - `snapshot.py` — **Fase 1.3**: capture orderbook snapshot → parquet. One file
   per batch, stored under `data/snapshots/YYYY-MM-DD/`. DuckDB-queryable.
+- `poll_loop.py` — **Fase 1.4**: continuous polling service. Two cadences:
+  5s book refresh + 5min re-discovery. Graceful shutdown, stats on exit.
 - `verify_polymarket_access.py` — **Fase 0**: cek konektivitas Gamma + CLOB,
   dry-run deteksi Tipe 1 arb. Sekarang pakai `polymarket_client.py` di bawah.
 - `fetch_data.py` — utility lama, ambil OHLCV BTC/USDT dari Binance via ccxt
@@ -31,7 +33,7 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
 | 1.1   | `polymarket_client.py` — async client foundation | ✅ |
 | 1.2   | `market_discovery.py` — smart market filter CLI | ✅ |
 | 1.3   | `snapshot.py` — orderbook snapshot + parquet storage | ✅ |
-| 1.4   | Poll loop service (overnight data collection) | belum |
+| 1.4   | `poll_loop.py` — periodic snapshot service | ✅ |
 | 2     | Query explorer via DuckDB | belum |
 | 3     | Wallet + execution layer (paper + live behind flag) | belum |
 | 4     | Risk guards + monitoring | belum |
@@ -262,6 +264,45 @@ ORDER BY timestamp_ms;
 Schema per row: `timestamp_ms`, `market_id`, `question`, `yes/no_best_bid/ask_price/size`,
 `yes/no_depth_5_ask/bid`, `book_sum`, `edge`, `fillable_size`, `days_remaining`, plus
 metadata (`condition_id`, `slug`, `category`, `end_date`, `liquidity`, `volume`).
+
+## Phase 1.4: `poll_loop.py`
+
+Continuous polling service — **ini yang Anda run overnight** untuk kumpulkan
+data empiris.
+
+```bash
+# default: 5s book interval, 5min re-discovery, 30 markets
+python poll_loop.py
+
+# faster polling, more markets
+python poll_loop.py --interval 2 --rediscover 120 --target 50
+
+# run overnight (background)
+nohup python poll_loop.py > poll.log 2>&1 &
+```
+
+Dua cadence:
+- **Book refresh** (5s): fetch CLOB books untuk market list yang sudah
+  diketahui, write parquet. Cepat, ~1s per cycle.
+- **Market re-discovery** (5min): re-run Gamma pipeline untuk pick up
+  market baru / drop expired. Lambat, ~3-5s.
+
+Graceful shutdown: Ctrl-C → finish cycle → print summary stats (uptime,
+cycles, rows, errors, edge range, arb detections).
+
+Setelah run overnight (~12 jam di 5s interval = ~8,640 snapshots × 30 market
+= ~259,200 rows), query dengan DuckDB:
+
+```sql
+-- pernah ada arb?
+SELECT COUNT(*) FROM read_parquet('data/snapshots/**/*.parquet')
+WHERE edge > 0;
+
+-- distribusi sum
+SELECT ROUND(book_sum, 3) AS sum_bucket, COUNT(*) AS n
+FROM read_parquet('data/snapshots/**/*.parquet')
+GROUP BY sum_bucket ORDER BY sum_bucket;
+```
 
 ## Catatan `fetch_data.py`
 
