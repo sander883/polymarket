@@ -11,22 +11,28 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
 
 - `requirements.txt` — dependensi Python
 - `.env.example` — template env (wallet + API keys, diisi nanti saat fase live)
-- `verify_polymarket_access.py` — **Fase 0**: cek konektivitas Gamma + CLOB, dry-run
-  deteksi Tipe 1 arb. Read-only, tanpa wallet.
+- `polymarket_client.py` — **Fase 1.1**: async client untuk Gamma + CLOB API.
+  Satu class dipakai semua fase berikutnya (retry, rate limit, parsing, typed
+  dataclasses). Read-only.
+- `verify_polymarket_access.py` — **Fase 0**: cek konektivitas Gamma + CLOB,
+  dry-run deteksi Tipe 1 arb. Sekarang pakai `polymarket_client.py` di bawah.
 - `fetch_data.py` — utility lama, ambil OHLCV BTC/USDT dari Binance via ccxt
   (dipakai nanti sebagai external signal kalau perlu)
 
 ## Roadmap fase
 
-| Fase | Isi | Status |
+| Fase  | Isi | Status |
 |---|---|---|
-| 0   | Verifikasi akses Gamma + CLOB dari lokasi Anda | **← saat ini** |
-| 1   | Data foundation (indexer Polymarket, parquet, DuckDB) | belum |
-| 2   | Query & market explorer CLI | belum |
-| 3   | Wallet + execution layer (paper + live behind flag) | belum |
-| 4   | Risk guards + monitoring | belum |
-| 5   | Backtest harness generic | belum |
-| 6   | Strategy module: Tipe 1 arb | belum |
+| 0     | Verifikasi akses Gamma + CLOB dari lokasi Anda | ✅ |
+| 1.1   | `polymarket_client.py` — async client foundation | ✅ |
+| 1.2   | Market discovery CLI (filter binary + liquid + window) | belum |
+| 1.3   | Orderbook snapshot + parquet storage | belum |
+| 1.4   | Poll loop service (overnight data collection) | belum |
+| 2     | Query explorer via DuckDB | belum |
+| 3     | Wallet + execution layer (paper + live behind flag) | belum |
+| 4     | Risk guards + monitoring | belum |
+| 5     | Backtest harness generic | belum |
+| 6     | Strategy module: Tipe 1 arb | belum |
 
 ## Install (Linux)
 
@@ -138,6 +144,56 @@ nomination) karena "volume kumulatif historis" ≠ "liquiditas aktif sekarang".
 Phase 1.2 (market discovery) akan ganti filter ke `liquidityNum` + `endDate`
 window + `yes_price ∈ [0.1, 0.9]` untuk hindari dead-tail.
 
+## Phase 1.1: `polymarket_client.py`
+
+Async client tunggal untuk semua komunikasi dengan Polymarket (Gamma + CLOB).
+Read-only. Dipakai oleh `verify_polymarket_access.py` dan semua script fase
+berikutnya. Semua retry, concurrency limit, parsing, dan error handling hidup
+di sini supaya kita punya satu tempat untuk reason tentang network behavior.
+
+**Apa yang ada di dalamnya**:
+
+- `PolymarketClient` — async context manager (`async with ...:`)
+- `get_markets(...)` — fetch market list dengan filter client-side
+- `get_orderbook(token_id)` — 1 orderbook
+- `get_orderbooks(token_ids)` — batch concurrent fetch (semaphore-bounded)
+- Dataclass: `Market`, `OrderBook`, `OrderBookLevel`
+- Exception hierarchy: `PolymarketError` → `NetworkError`, `APIError`,
+  `ParseError` (caller bisa pilih mana yang fatal)
+- Retry: 3x exponential backoff (0.5s, 1s, 2s) untuk network + 5xx. 4xx
+  langsung raise.
+- Concurrency: semaphore default 8 (tunable via konstruktor).
+- Default sort: `liquidityNum` desc — avoid dead-tail novelty bias yang
+  kita temukan di Phase 0.
+
+**Demo**:
+
+```bash
+python polymarket_client.py
+```
+
+Output contoh (expected): list 5 market paling liquid + bid/ask/spread untuk
+token YES mereka. Kalau ini jalan, Fase 1.1 confirmed working end-to-end.
+
+**Library usage** (untuk script Anda sendiri):
+
+```python
+import asyncio
+from polymarket_client import PolymarketClient
+
+async def main():
+    async with PolymarketClient() as client:
+        markets = await client.get_markets(limit=20, min_liquidity=50_000)
+        token_ids = [m.yes_token_id for m in markets if m.yes_token_id]
+        books = await client.get_orderbooks(token_ids)
+        for m in markets:
+            book = books.get(m.yes_token_id)
+            if book and book.best_ask:
+                print(m.market_id, m.question[:60], book.best_ask.price)
+
+asyncio.run(main())
+```
+
 ## Catatan `fetch_data.py`
 
 Script ini dari iterasi awal — fetch OHLCV + ticker BTC dari Binance via ccxt.
@@ -148,12 +204,16 @@ signal. Jalankan dengan:
 python fetch_data.py
 ```
 
-## Troubleshooting Fase 0
+## Troubleshooting
 
 - `httpx.ConnectError` / timeout → koneksi diblok atau ISP throttle Cloudflare
 - Gamma `403` → kemungkinan geo-block (Polymarket blokir US). Kalau Anda non-US
   dan masih 403, coba VPN atau ubah user-agent
 - `ModuleNotFoundError: httpx` → `pip install -r requirements.txt` belum dijalankan
   dalam virtualenv aktif
-- Scan muncul tapi semua market "no liquidity" → turunkan `--min-volume`, atau
+- Scan muncul tapi semua market "no liquidity" → turunkan `--min-liquidity`, atau
   market yang diambil kebetulan resolve-nya dekat dan orderbook sudah thin
+- `PolymarketNetworkError` setelah 3x retry → network unstable. Tambah timeout
+  via konstruktor: `PolymarketClient(timeout=30)`
+- `RuntimeError: PolymarketClient must be used inside async with context` →
+  Anda instantiate tanpa `async with`. Fix: `async with PolymarketClient() as c:`
