@@ -14,6 +14,8 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
 - `polymarket_client.py` — **Fase 1.1**: async client untuk Gamma + CLOB API.
   Satu class dipakai semua fase berikutnya (retry, rate limit, parsing, typed
   dataclasses). Read-only.
+- `market_discovery.py` — **Fase 1.2**: CLI market explorer. Two-stage pipeline:
+  metadata filter (Gamma) → orderbook filter (CLOB). Outputs tabel atau JSON.
 - `verify_polymarket_access.py` — **Fase 0**: cek konektivitas Gamma + CLOB,
   dry-run deteksi Tipe 1 arb. Sekarang pakai `polymarket_client.py` di bawah.
 - `fetch_data.py` — utility lama, ambil OHLCV BTC/USDT dari Binance via ccxt
@@ -25,7 +27,7 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
 |---|---|---|
 | 0     | Verifikasi akses Gamma + CLOB dari lokasi Anda | ✅ |
 | 1.1   | `polymarket_client.py` — async client foundation | ✅ |
-| 1.2   | Market discovery CLI (filter binary + liquid + window) | belum |
+| 1.2   | `market_discovery.py` — smart market filter CLI | ✅ |
 | 1.3   | Orderbook snapshot + parquet storage | belum |
 | 1.4   | Poll loop service (overnight data collection) | belum |
 | 2     | Query explorer via DuckDB | belum |
@@ -193,6 +195,31 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Phase 1.2: `market_discovery.py`
+
+Two-stage pipeline yang memecahkan masalah "Phase 0 cuma dapat dead-tail":
+
+1. **Stage 1 (Gamma, metadata filter)**: paginate markets sorted by `liquidityNum`,
+   filter binary + active + endDate window + min liquidity.
+2. **Stage 2 (CLOB, orderbook filter)**: batch-fetch books, apply `yes_ask ∈
+   [price_lo, price_hi]` to exclude 0.01/0.99 zombie markets, compute edge.
+
+```bash
+# default: target 30, liq>$50k, end 2h–90d, yes∈[0.05,0.95]
+python market_discovery.py
+
+# tighter
+python market_discovery.py --min-liquidity 200000 --price-lo 0.10 --price-hi 0.90
+
+# JSON output for Phase 1.3 piping
+python market_discovery.py --json > markets.json
+
+# verbose logging (Gamma pagination + book fetch details)
+python market_discovery.py -v
+```
+
+Output sorted by edge descending (closest to arb first).
 
 ## Catatan `fetch_data.py`
 
