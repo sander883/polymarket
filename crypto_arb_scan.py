@@ -141,41 +141,53 @@ async def fetch_crypto_markets(
 ) -> list[tuple[Market, float, str]]:
     """Fetch Polymarket markets related to BTC price targets.
 
+    Uses the Gamma /events?tag_id=21 endpoint to discover crypto markets
+    directly, instead of searching the top-200 by liquidity (which is
+    dominated by politics/sports and misses most crypto markets).
+
     Returns list of (Market, strike_price, direction).
     """
-    # fetch broader set — crypto markets might have lower liquidity
-    markets = await client.get_markets(limit=200, min_liquidity=100)
+    # Primary: use tag_id=21 (Crypto) via /events endpoint
+    # This returns event groups, each containing multiple BTC price markets
+    markets = await client.get_events_markets(tag_id=21, limit=200, min_liquidity=0)
 
-    # first pass: find anything crypto-related (word boundary to avoid "Hegseth" matching "eth")
-    crypto_patterns = [
-        re.compile(r"\bbtc\b", re.IGNORECASE),
-        re.compile(r"\bbitcoin\b", re.IGNORECASE),
-        re.compile(r"\bcrypto\b", re.IGNORECASE),
-        re.compile(r"\beth\b", re.IGNORECASE),
-        re.compile(r"\bethereum\b", re.IGNORECASE),
-        re.compile(r"\bsol\b", re.IGNORECASE),
-        re.compile(r"\bsolana\b", re.IGNORECASE),
-    ]
-    crypto_questions = []
-    for m in markets:
-        if any(p.search(m.question) for p in crypto_patterns):
-            crypto_questions.append(m)
+    # Fallback: also check /markets with tag_id filter
+    if not markets:
+        markets = await client.get_markets(limit=500, min_liquidity=0, tag_id=21)
+
+    # If tag_id filtering didn't work, fall back to keyword search
+    if not markets:
+        if verbose:
+            print("  tag_id=21 returned 0 markets, falling back to keyword search")
+        markets = await client.get_markets(limit=200, min_liquidity=100)
+        crypto_patterns = [
+            re.compile(r"\bbtc\b", re.IGNORECASE),
+            re.compile(r"\bbitcoin\b", re.IGNORECASE),
+            re.compile(r"\bcrypto\b", re.IGNORECASE),
+            re.compile(r"\beth\b", re.IGNORECASE),
+            re.compile(r"\bethereum\b", re.IGNORECASE),
+            re.compile(r"\bsol\b", re.IGNORECASE),
+            re.compile(r"\bsolana\b", re.IGNORECASE),
+        ]
+        markets = [m for m in markets if any(p.search(m.question) for p in crypto_patterns)]
 
     if verbose:
-        print(f"  Crypto-keyword markets: {len(crypto_questions)}")
-        for m in crypto_questions[:20]:
+        print(f"  Crypto markets from Gamma: {len(markets)}")
+        # Show sample of BTC-related questions
+        btc_markets = [m for m in markets if "btc" in m.question.lower() or "bitcoin" in m.question.lower()]
+        print(f"  BTC-specific: {len(btc_markets)}")
+        for m in btc_markets[:20]:
             parsed = parse_strike(m.question)
             tag = f" -> strike=${parsed[0]:,.0f} {parsed[1]}" if parsed else " -> NO PARSE"
             print(f"    {m.question[:70]}{tag}")
-        if not crypto_questions:
-            # show sample of what we DID get to diagnose
-            print(f"  No crypto keywords found. Sample of all {len(markets)} markets:")
+        if not btc_markets and markets:
+            print(f"  No BTC markets. Sample of {len(markets)} crypto markets:")
             for m in markets[:15]:
                 print(f"    [{m.category}] {m.question[:70]}")
 
-    # second pass: parse strike prices (BTC only for now)
-    crypto = []
-    for m in crypto_questions:
+    # Parse strike prices (BTC only for now)
+    crypto: list[tuple[Market, float, str]] = []
+    for m in markets:
         q = m.question.lower()
         if "btc" not in q and "bitcoin" not in q:
             continue
@@ -183,14 +195,11 @@ async def fetch_crypto_markets(
         if parsed:
             crypto.append((m, parsed[0], parsed[1]))
 
-    # third pass: "Up or Down" markets (no strike, direction-only)
-    # These resolve based on BTC price at market open vs close
-    # We track them separately — edge comes from momentum, not strike
+    # "Up or Down" markets (no strike, direction-only)
     up_down_pattern = re.compile(r"(?:BTC|Bitcoin)\s+Up or Down", re.IGNORECASE)
-    for m in crypto_questions:
-        if up_down_pattern.search(m.question) and m not in [c[0] for c in crypto]:
-            # use current BTC price as "strike" — YES=up, NO=down
-            # the real reference is the market open price, but we approximate
+    seen_ids = {c[0].market_id for c in crypto}
+    for m in markets:
+        if up_down_pattern.search(m.question) and m.market_id not in seen_ids:
             crypto.append((m, 0.0, "up_or_down"))
 
     return crypto

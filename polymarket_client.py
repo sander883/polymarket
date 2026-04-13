@@ -382,6 +382,7 @@ class PolymarketClient:
         ascending: bool = False,
         min_volume: float = 0.0,
         min_liquidity: float = 0.0,
+        tag_id: int | None = None,
         price_range: tuple[float, float] | None = None,
     ) -> list[Market]:
         """List active markets from the Gamma API, filtered client-side.
@@ -394,6 +395,7 @@ class PolymarketClient:
                 volumeNum dead-tail bias documented in the README.
             ascending: sort direction.
             min_volume / min_liquidity: client-side threshold.
+            tag_id: Gamma tag filter (e.g. 21 for Crypto).
             price_range: if set (lo, hi), drop markets whose implied yes
                 probability is outside [lo, hi]. Requires a fetched order
                 book to know, so we skip it here — it's applied in Phase 1.2
@@ -410,6 +412,8 @@ class PolymarketClient:
             "order": order,
             "ascending": "true" if ascending else "false",
         }
+        if tag_id is not None:
+            params["tag_id"] = str(tag_id)
         data = await self._request("GET", f"{self._gamma_url}/markets", params=params)
 
         if not isinstance(data, list):
@@ -432,6 +436,96 @@ class PolymarketClient:
             if len(parsed) >= limit:
                 break
         return parsed
+
+    async def get_events(
+        self,
+        *,
+        tag_id: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        active: bool = True,
+        closed: bool = False,
+        order: str = "liquidityNum",
+        ascending: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Fetch events from Gamma /events endpoint.
+
+        Events group related markets (e.g. all BTC price targets for one
+        time window). Returns raw event dicts — each has a "markets" list.
+
+        Args:
+            tag_id: filter by tag (21 = Crypto).
+            limit: max events to return.
+        """
+        params: dict[str, Any] = {
+            "limit": str(limit),
+            "offset": str(offset),
+            "active": "true" if active else "false",
+            "closed": "true" if closed else "false",
+            "order": order,
+            "ascending": "true" if ascending else "false",
+        }
+        if tag_id is not None:
+            params["tag_id"] = str(tag_id)
+        data = await self._request("GET", f"{self._gamma_url}/events", params=params)
+        if not isinstance(data, list):
+            raise PolymarketParseError(
+                f"expected list from /events, got {type(data).__name__}"
+            )
+        return data
+
+    async def get_events_markets(
+        self,
+        *,
+        tag_id: int,
+        limit: int = 100,
+        min_liquidity: float = 0.0,
+    ) -> list[Market]:
+        """Fetch markets via the /events endpoint, filtered by tag.
+
+        This is the key method for crypto market discovery — the /events
+        endpoint with tag_id=21 returns crypto event groups, each containing
+        multiple BTC price-target markets that are invisible to the normal
+        /markets endpoint (which is dominated by high-liquidity politics).
+
+        Paginates through all available events up to `limit` events.
+        """
+        all_markets: list[Market] = []
+        offset = 0
+        page_size = 50  # events per page
+
+        while True:
+            events = await self.get_events(
+                tag_id=tag_id,
+                limit=page_size,
+                offset=offset,
+                active=True,
+                closed=False,
+            )
+            if not events:
+                break
+
+            for event in events:
+                raw_markets = event.get("markets", [])
+                if not isinstance(raw_markets, list):
+                    continue
+                for raw in raw_markets:
+                    if not isinstance(raw, dict):
+                        continue
+                    m = parse_market(raw)
+                    if m is None:
+                        continue
+                    if m.liquidity < min_liquidity:
+                        continue
+                    all_markets.append(m)
+
+            offset += page_size
+            if len(events) < page_size:
+                break
+            if offset >= limit * page_size:
+                break
+
+        return all_markets
 
     # ---- CLOB: order book ------------------------------------------------
 
