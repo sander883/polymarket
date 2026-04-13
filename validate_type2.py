@@ -32,6 +32,11 @@ DRAW_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+WIN_PATTERN = re.compile(
+    r"^Will\s+(.+?)\s+win on\s+(\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+
 
 def load_snapshots(data_dir: Path) -> pd.DataFrame:
     glob_path = str(data_dir / "**" / "*.parquet")
@@ -55,14 +60,23 @@ def find_match_groups(questions: list[str]) -> dict[str, tuple[str, str, str]]:
         if m:
             draw_markets[q] = (m.group(1).strip(), m.group(2).strip())
 
+    win_by_team: dict[str, dict[str, str]] = {}
+    for q in questions:
+        m = WIN_PATTERN.match(q)
+        if m:
+            team = m.group(1).strip()
+            date = m.group(2)
+            win_by_team.setdefault(team, {})[date] = q
+
     groups: dict[str, tuple[str, str, str]] = {}
     for draw_q, (team_a, team_b) in draw_markets.items():
-        # require BOTH team names to avoid cross-match contamination
-        a_wins = [q for q in questions if q.startswith(f"Will {team_a} win") and team_b in q]
-        b_wins = [q for q in questions if q.startswith(f"Will {team_b} win") and team_a in q]
-        if a_wins and b_wins:
-            key = f"{team_a} vs {team_b}"
-            groups[key] = (draw_q, a_wins[0], b_wins[0])
+        a_dates = win_by_team.get(team_a, {})
+        b_dates = win_by_team.get(team_b, {})
+        common_dates = set(a_dates.keys()) & set(b_dates.keys())
+        if common_dates:
+            date = sorted(common_dates)[0]
+            key = f"{team_a} vs {team_b} ({date})"
+            groups[key] = (draw_q, a_dates[date], b_dates[date])
 
     return groups
 

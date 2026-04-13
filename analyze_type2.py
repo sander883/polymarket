@@ -36,6 +36,12 @@ DRAW_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# "Will Leeds United FC win on 2026-04-13?"
+WIN_PATTERN = re.compile(
+    r"^Will\s+(.+?)\s+win on\s+(\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+
 
 def load_snapshots(data_dir: Path) -> pd.DataFrame:
     """Load all parquet snapshots via DuckDB (fast glob read)."""
@@ -55,29 +61,43 @@ def find_match_groups(
 ) -> dict[str, tuple[str, str, str]]:
     """Identify match triples from question text.
 
+    Win questions use date format: "Will TeamA win on YYYY-MM-DD?"
+    We pair them by finding the common date between both teams' win questions.
+
     Returns {match_key: (draw_question, team_a_win_question, team_b_win_question)}.
     Only complete triples (all 3 found) are returned.
     """
     # step 1: find draw markets, extract team names
-    draw_markets: dict[str, tuple[str, str]] = {}  # draw_question -> (team_a, team_b)
+    draw_markets: dict[str, tuple[str, str]] = {}
     for q in questions:
         m = DRAW_PATTERN.match(q)
         if m:
             draw_markets[q] = (m.group(1).strip(), m.group(2).strip())
 
-    # step 2: for each draw, find matching win markets
+    # step 2: index all win questions by (team, date)
+    # team -> {date -> question}
+    win_by_team: dict[str, dict[str, str]] = {}
+    for q in questions:
+        m = WIN_PATTERN.match(q)
+        if m:
+            team = m.group(1).strip()
+            date = m.group(2)
+            win_by_team.setdefault(team, {})[date] = q
+
+    # step 3: for each draw, find win questions where both teams share a date
     groups: dict[str, tuple[str, str, str]] = {}
     incomplete = 0
 
     for draw_q, (team_a, team_b) in draw_markets.items():
-        # require BOTH team names to avoid cross-match contamination
-        # (e.g., "Will Leeds win vs Wolverhampton" not "Will Leeds win vs Chelsea")
-        a_wins = [q for q in questions if q.startswith(f"Will {team_a} win") and team_b in q]
-        b_wins = [q for q in questions if q.startswith(f"Will {team_b} win") and team_a in q]
+        a_dates = win_by_team.get(team_a, {})
+        b_dates = win_by_team.get(team_b, {})
+        common_dates = set(a_dates.keys()) & set(b_dates.keys())
 
-        if a_wins and b_wins:
-            key = f"{team_a} vs {team_b}"
-            groups[key] = (draw_q, a_wins[0], b_wins[0])
+        if common_dates:
+            # pick the date (should be exactly one for a given match)
+            date = sorted(common_dates)[0]
+            key = f"{team_a} vs {team_b} ({date})"
+            groups[key] = (draw_q, a_dates[date], b_dates[date])
         else:
             incomplete += 1
 
