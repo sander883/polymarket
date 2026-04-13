@@ -131,16 +131,39 @@ def parse_strike(question: str) -> tuple[float, str] | None:
 
 async def fetch_crypto_markets(
     client: PolymarketClient,
+    *,
+    verbose: bool = False,
 ) -> list[tuple[Market, float, str]]:
     """Fetch Polymarket markets related to BTC price targets.
 
     Returns list of (Market, strike_price, direction).
     """
-    # fetch markets mentioning BTC/Bitcoin with decent liquidity
-    markets = await client.get_markets(limit=200, min_liquidity=500)
+    # fetch broader set — crypto markets might have lower liquidity
+    markets = await client.get_markets(limit=200, min_liquidity=100)
 
-    crypto = []
+    # first pass: find anything crypto-related
+    crypto_keywords = ["btc", "bitcoin", "crypto", "eth", "ethereum", "sol", "solana"]
+    crypto_questions = []
     for m in markets:
+        q = m.question.lower()
+        if any(kw in q for kw in crypto_keywords):
+            crypto_questions.append(m)
+
+    if verbose:
+        print(f"  Crypto-keyword markets: {len(crypto_questions)}")
+        for m in crypto_questions[:20]:
+            parsed = parse_strike(m.question)
+            tag = f" -> strike=${parsed[0]:,.0f} {parsed[1]}" if parsed else " -> NO PARSE"
+            print(f"    {m.question[:70]}{tag}")
+        if not crypto_questions:
+            # show sample of what we DID get to diagnose
+            print(f"  No crypto keywords found. Sample of all {len(markets)} markets:")
+            for m in markets[:15]:
+                print(f"    [{m.category}] {m.question[:70]}")
+
+    # second pass: parse strike prices (BTC only for now)
+    crypto = []
+    for m in crypto_questions:
         q = m.question.lower()
         if "btc" not in q and "bitcoin" not in q:
             continue
@@ -168,7 +191,7 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
     # 2. Polymarket crypto markets
     async with PolymarketClient() as client:
         t0 = time.time()
-        raw_markets = await fetch_crypto_markets(client)
+        raw_markets = await fetch_crypto_markets(client, verbose=verbose)
         poly_ms = (time.time() - t0) * 1000
         print(f"  Polymarket BTC markets: {len(raw_markets)} found ({poly_ms:.0f}ms)")
 
