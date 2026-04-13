@@ -402,46 +402,102 @@ class SXBetClient:
         self,
         market_hashes: list[str],
     ) -> dict[str, SXOdds]:
-        """Fetch active orders for given markets and aggregate into best odds.
+        """Fetch best odds for given markets.
 
+        Tries /orders/odds/best first (pre-aggregated), falls back to /orders.
         Returns {market_hash: SXOdds}.
         """
         if not market_hashes:
             return {}
 
-        # batch in chunks to avoid oversized requests
         chunk_size = 20
         all_odds: dict[str, SXOdds] = {}
 
         for i in range(0, len(market_hashes), chunk_size):
             chunk = market_hashes[i:i + chunk_size]
             params = {"marketHashes": ",".join(chunk)}
-            data = await self._get("/active-orders", params=params)
 
-            inner = data.get("data", {}) if isinstance(data, dict) else {}
-            raw_orders = inner if isinstance(inner, list) else inner.get("orders", [])
-            if not isinstance(raw_orders, list):
-                raw_orders = []
+            # try /orders/odds/best first (returns pre-aggregated best odds)
+            try:
+                data = await self._get("/orders/odds/best", params=params)
+                all_odds.update(self._parse_best_odds(chunk, data))
+                continue
+            except SXBetAPIError as exc:
+                if exc.status_code == 404:
+                    logger.debug("/orders/odds/best returned 404, trying /orders")
+                else:
+                    raise
 
-            # group orders by market hash
-            orders_by_market: dict[str, list[SXOrder]] = {}
-            for raw in raw_orders:
-                order = parse_order(raw)
-                if order and order.remaining_size > 0:
-                    orders_by_market.setdefault(order.market_hash, []).append(order)
-
-            # aggregate
-            for mh in chunk:
-                orders = orders_by_market.get(mh, [])
-                all_odds[mh] = aggregate_odds(mh, orders)
+            # fallback: /orders with raw order list
+            try:
+                data = await self._get("/orders", params=params)
+                all_odds.update(self._parse_raw_orders(chunk, data))
+            except SXBetAPIError as exc:
+                if exc.status_code == 404:
+                    logger.warning("both /orders/odds/best and /orders returned 404")
+                    for mh in chunk:
+                        all_odds[mh] = SXOdds(market_hash=mh)
+                else:
+                    raise
 
         return all_odds
 
     async def get_odds_by_league(self, league_id: int) -> dict[str, SXOdds]:
         """Fetch best odds for all markets in a league."""
         params: dict[str, Any] = {"leagueId": league_id}
-        data = await self._get("/active-orders", params=params)
 
+        # try /orders/odds/best first
+        try:
+            data = await self._get("/orders/odds/best", params=params)
+            return self._parse_best_odds([], data)
+        except SXBetAPIError as exc:
+            if exc.status_code != 404:
+                raise
+
+        # fallback: /orders
+        try:
+            data = await self._get("/orders", params=params)
+            return self._parse_raw_orders([], data)
+        except SXBetAPIError as exc:
+            if exc.status_code == 404:
+                logger.warning("no orders endpoint available for league %d", league_id)
+                return {}
+            raise
+
+    def _parse_best_odds(self, expected_hashes: list[str], data: Any) -> dict[str, SXOdds]:
+        """Parse response from /orders/odds/best endpoint."""
+        result: dict[str, SXOdds] = {}
+        inner = data.get("data", {}) if isinstance(data, dict) else {}
+
+        # response may be a dict keyed by marketHash, or a list
+        if isinstance(inner, dict):
+            for mh, odds_data in inner.items():
+                if isinstance(odds_data, dict):
+                    result[mh] = SXOdds(
+                        market_hash=mh,
+                        outcome_one_best=_as_float(odds_data.get("outcomeOne")) or None,
+                        outcome_two_best=_as_float(odds_data.get("outcomeTwo")) or None,
+                    )
+        elif isinstance(inner, list):
+            for item in inner:
+                if isinstance(item, dict):
+                    mh = str(item.get("marketHash", ""))
+                    if mh:
+                        result[mh] = SXOdds(
+                            market_hash=mh,
+                            outcome_one_best=_as_float(item.get("outcomeOne")) or None,
+                            outcome_two_best=_as_float(item.get("outcomeTwo")) or None,
+                        )
+
+        # ensure all expected hashes have entries
+        for mh in expected_hashes:
+            if mh not in result:
+                result[mh] = SXOdds(market_hash=mh)
+
+        return result
+
+    def _parse_raw_orders(self, expected_hashes: list[str], data: Any) -> dict[str, SXOdds]:
+        """Parse response from /orders endpoint (raw order list)."""
         inner = data.get("data", {}) if isinstance(data, dict) else {}
         raw_orders = inner if isinstance(inner, list) else inner.get("orders", [])
         if not isinstance(raw_orders, list):
@@ -453,10 +509,16 @@ class SXBetClient:
             if order and order.remaining_size > 0:
                 orders_by_market.setdefault(order.market_hash, []).append(order)
 
-        return {
+        result = {
             mh: aggregate_odds(mh, orders)
             for mh, orders in orders_by_market.items()
         }
+
+        for mh in expected_hashes:
+            if mh not in result:
+                result[mh] = SXOdds(market_hash=mh)
+
+        return result
 
 
 # ---------------------------------------------------------------------------
