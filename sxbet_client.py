@@ -34,6 +34,8 @@ import httpx
 logger = logging.getLogger(__name__)
 
 SX_API_URL = "https://api.sx.bet"
+# USDC on SX Mainnet — required for /orders endpoints
+SX_USDC_ADDRESS = "0xe2aa35C2039Bd0Ff196A6Ef99523CC0D3972ae3e"
 
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_MAX_RETRIES = 3
@@ -401,6 +403,8 @@ class SXBetClient:
     async def get_odds(
         self,
         market_hashes: list[str],
+        *,
+        base_token: str = SX_USDC_ADDRESS,
     ) -> dict[str, SXOdds]:
         """Fetch best odds for given markets.
 
@@ -415,7 +419,10 @@ class SXBetClient:
 
         for i in range(0, len(market_hashes), chunk_size):
             chunk = market_hashes[i:i + chunk_size]
-            params = {"marketHashes": ",".join(chunk)}
+            params: dict[str, Any] = {
+                "marketHashes": ",".join(chunk),
+                "baseToken": base_token,
+            }
 
             # try /orders/odds/best first (returns pre-aggregated best odds)
             try:
@@ -442,9 +449,17 @@ class SXBetClient:
 
         return all_odds
 
-    async def get_odds_by_league(self, league_id: int) -> dict[str, SXOdds]:
+    async def get_odds_by_league(
+        self,
+        league_id: int,
+        *,
+        base_token: str = SX_USDC_ADDRESS,
+    ) -> dict[str, SXOdds]:
         """Fetch best odds for all markets in a league."""
-        params: dict[str, Any] = {"leagueId": league_id}
+        params: dict[str, Any] = {
+            "leagueId": league_id,
+            "baseToken": base_token,
+        }
 
         # try /orders/odds/best first
         try:
