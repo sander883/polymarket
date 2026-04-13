@@ -256,8 +256,122 @@ def get_binance_btc_price() -> float:
     return float(ticker["last"])
 
 
+def get_binance_btc_price_at(ts_ms: int) -> float | None:
+    """Fetch the BTC/USDT price at a specific timestamp using 1-min klines.
+
+    Returns the open price of the 1-min candle that contains the timestamp.
+    This is the reference price for Up/Down market resolution.
+    """
+    try:
+        exchange = ccxt.binance({"enableRateLimit": True})
+        # fetch 1 candle starting at the given timestamp
+        ohlcv = exchange.fetch_ohlcv("BTC/USDT", "1m", since=ts_ms, limit=1)
+        if ohlcv and len(ohlcv) > 0:
+            # [timestamp, open, high, low, close, volume]
+            return float(ohlcv[0][1])  # open price
+    except Exception as exc:
+        logger.warning("failed to fetch historical kline at %s: %s", ts_ms, exc)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Polymarket crypto market parser
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Up/Down market parser
+# ---------------------------------------------------------------------------
+
+# "BTC Up or Down - April 13, 4:00 AM ET"
+# "Bitcoin 5 Minute Up or Down - 10:30 AM ET"
+UP_DOWN_PATTERN = re.compile(
+    r"(?:BTC|Bitcoin)\s+(?:(\d+)\s*(?:Minute|Min)\s+)?Up\s+or\s+Down",
+    re.IGNORECASE,
+)
+
+# Extract time from Up/Down question: "... 4:00 AM ET" or "... 4AM ET"
+UP_DOWN_TIME_PATTERN = re.compile(
+    r"(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*ET",
+    re.IGNORECASE,
+)
+
+# Extract date from Up/Down question: "April 13" or "2026-04-13"
+UP_DOWN_DATE_PATTERN = re.compile(
+    r"(?:(\w+)\s+(\d{1,2})(?:,?\s*(\d{4}))?)",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class UpDownInfo:
+    """Parsed info for an Up/Down market."""
+    window_minutes: int          # 5, 15, 60, etc.
+    window_start_utc: datetime   # start of the resolution window
+    window_end_utc: datetime     # end of the resolution window
+    open_price: float | None     # BTC price at window start (fetched from Binance)
+    minutes_elapsed: float       # how many minutes into the window we are
+
+
+def parse_up_down(question: str) -> UpDownInfo | None:
+    """Parse an Up/Down market question into window timing.
+
+    Returns UpDownInfo or None if not an Up/Down market.
+    """
+    ud_match = UP_DOWN_PATTERN.search(question)
+    if not ud_match:
+        return None
+
+    # Window duration: default 5 min if not specified
+    duration_str = ud_match.group(1)
+    window_minutes = int(duration_str) if duration_str else 5
+
+    # Parse the time
+    time_m = UP_DOWN_TIME_PATTERN.search(question)
+    if not time_m:
+        return None
+
+    hour = int(time_m.group(1))
+    minute = int(time_m.group(2) or "0")
+    ampm = time_m.group(3).upper()
+    if ampm == "PM" and hour != 12:
+        hour += 12
+    elif ampm == "AM" and hour == 12:
+        hour = 0
+
+    # ET -> UTC (EDT = UTC-4)
+    utc_hour = hour + 4
+
+    # Parse the date
+    now = datetime.now(timezone.utc)
+    date_m = UP_DOWN_DATE_PATTERN.search(question)
+    if date_m:
+        month_name = date_m.group(1).lower()
+        month = MONTH_MAP.get(month_name, now.month)
+        day = int(date_m.group(2))
+        year = int(date_m.group(3)) if date_m.group(3) else now.year
+    else:
+        year, month, day = now.year, now.month, now.day
+
+    try:
+        window_start = datetime(year, month, day, tzinfo=timezone.utc) + timedelta(hours=utc_hour, minutes=minute)
+        window_end = window_start + timedelta(minutes=window_minutes)
+    except ValueError:
+        return None
+
+    minutes_elapsed = (now - window_start).total_seconds() / 60
+
+    return UpDownInfo(
+        window_minutes=window_minutes,
+        window_start_utc=window_start,
+        window_end_utc=window_end,
+        open_price=None,  # filled later
+        minutes_elapsed=minutes_elapsed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Strike price parser
 # ---------------------------------------------------------------------------
 
 
@@ -469,12 +583,112 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
         hte = cm.hours_to_expiry
 
         if direction == "up_or_down":
+            # ── Up/Down market edge detection ──
+            # YES = BTC goes UP from window open price
+            # NO  = BTC goes DOWN from window open price
+            #
+            # Edge: if BTC already moved significantly from window open,
+            # but Polymarket still pricing near 0.50, that's latency lag.
+
+            ud_info = parse_up_down(cm.market.question)
+            if ud_info is None:
+                if verbose:
+                    print(f"  UD  SKIP (can't parse)  '{cm.market.question[:55]}'")
+                continue
+
+            # Only process windows that are currently active
+            if ud_info.minutes_elapsed < 0:
+                if verbose:
+                    print(f"  UD  SKIP (not started, {-ud_info.minutes_elapsed:.0f}m away)  "
+                          f"'{cm.market.question[:50]}'")
+                continue
+            if ud_info.minutes_elapsed > ud_info.window_minutes:
+                if verbose:
+                    print(f"  UD  SKIP (expired)  '{cm.market.question[:50]}'")
+                continue
+
+            # Fetch the BTC open price for this window
+            window_start_ms = int(ud_info.window_start_utc.timestamp() * 1000)
+            open_price = get_binance_btc_price_at(window_start_ms)
+            ud_info.open_price = open_price
+
+            if open_price is None or open_price <= 0:
+                if verbose:
+                    print(f"  UD  SKIP (no open price)  '{cm.market.question[:50]}'")
+                continue
+
+            # Calculate BTC movement from open
+            btc_move_pct = (btc_price - open_price) / open_price * 100
+            minutes_left = ud_info.window_minutes - ud_info.minutes_elapsed
+
             if verbose:
-                hte_str = f"{hte:.1f}h" if hte is not None else "??h"
-                print(f"  UD  {'':<10}  up/dn  "
+                print(f"  UD  {ud_info.window_minutes}min  "
+                      f"open=${open_price:,.0f}  now=${btc_price:,.0f}  "
+                      f"move={btc_move_pct:+.3f}%  "
+                      f"{ud_info.minutes_elapsed:.1f}m in / {minutes_left:.1f}m left  "
                       f"YES={cm.yes_ask:.3f} NO={cm.no_ask:.3f}  "
-                      f"exp={hte_str}  "
-                      f"'{cm.market.question[:50]}'")
+                      f"'{cm.market.question[:40]}'")
+
+            # Edge detection for Up/Down:
+            # With <2 min left and BTC clearly moved, the market should
+            # be pricing the winning side near 0.80-0.95.
+            #
+            # Thresholds scale with time remaining:
+            #   <1 min left: 0.05% move is enough (BTC unlikely to reverse)
+            #   1-2 min left: 0.10% move needed
+            #   2-3 min left: 0.15% move needed
+            #   >3 min left: 0.20% move needed (more time for reversal)
+
+            if minutes_left <= 1:
+                move_threshold = 0.05
+                fair_winner = 0.92
+            elif minutes_left <= 2:
+                move_threshold = 0.10
+                fair_winner = 0.85
+            elif minutes_left <= 3:
+                move_threshold = 0.15
+                fair_winner = 0.75
+            else:
+                move_threshold = 0.20
+                fair_winner = 0.65
+
+            if abs(btc_move_pct) >= move_threshold:
+                # BTC has moved enough — determine which side to buy
+                if btc_move_pct > 0:
+                    # BTC up → YES should be high
+                    if cm.yes_ask < fair_winner and cm.yes_ask > 0:
+                        edge = fair_winner - cm.yes_ask
+                        confidence = "HIGH" if minutes_left <= 1 else "MEDIUM" if minutes_left <= 2 else "LOW"
+                        signals.append(ArbSignal(
+                            crypto_market=cm,
+                            binance_price=btc_price,
+                            fair_value=(f"YES ~{fair_winner:.0%} [{confidence}, "
+                                        f"BTC +{btc_move_pct:.3f}% from open, "
+                                        f"{minutes_left:.0f}m left]"),
+                            poly_yes_ask=cm.yes_ask,
+                            poly_no_ask=cm.no_ask,
+                            edge_description=(f"buy YES @ {cm.yes_ask:.3f}, "
+                                              f"BTC ${btc_price:,.0f} up from open ${open_price:,.0f}"),
+                            edge_pct=edge * 100,
+                        ))
+                else:
+                    # BTC down → NO should be high (NO = "down")
+                    if cm.no_ask < fair_winner and cm.no_ask > 0:
+                        edge = fair_winner - cm.no_ask
+                        confidence = "HIGH" if minutes_left <= 1 else "MEDIUM" if minutes_left <= 2 else "LOW"
+                        signals.append(ArbSignal(
+                            crypto_market=cm,
+                            binance_price=btc_price,
+                            fair_value=(f"NO ~{fair_winner:.0%} [{confidence}, "
+                                        f"BTC {btc_move_pct:.3f}% from open, "
+                                        f"{minutes_left:.0f}m left]"),
+                            poly_yes_ask=cm.yes_ask,
+                            poly_no_ask=cm.no_ask,
+                            edge_description=(f"buy NO @ {cm.no_ask:.3f}, "
+                                              f"BTC ${btc_price:,.0f} down from open ${open_price:,.0f}"),
+                            edge_pct=edge * 100,
+                        ))
+
             continue
 
         if strike <= 0:
