@@ -331,9 +331,9 @@ async def run_loop(interval: float, verbose: bool) -> None:
 
             try:
                 signals = await scan_once(verbose=verbose)
-                btc_price = get_binance_btc_price()
                 if signals:
                     total_signals += len(signals)
+                    btc_price = signals[0].binance_price
                     print_report(signals, btc_price)
                 else:
                     print(f"  No edge detected.\n")
@@ -372,10 +372,16 @@ def main() -> int:
                    help="show all markets, not just mispricings")
     args = p.parse_args()
 
+    # suppress noisy library loggers
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
+        level=logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+    if args.verbose:
+        logging.getLogger("crypto_arb_scan").setLevel(logging.DEBUG)
+    # keep libraries quiet regardless of -v
+    for noisy in ("ccxt", "httpx", "httpcore", "urllib3", "hpack"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if args.loop > 0:
         return asyncio.run(run_loop(args.loop, args.verbose))
