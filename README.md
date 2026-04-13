@@ -24,6 +24,9 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
   dry-run deteksi Tipe 1 arb. Sekarang pakai `polymarket_client.py` di bawah.
 - `fetch_data.py` — utility lama, ambil OHLCV BTC/USDT dari Binance via ccxt
   (dipakai nanti sebagai external signal kalau perlu)
+- `analyze_type2.py` — **Fase 2**: analisis Tipe 2 (three-way sum) arb dari
+  data overnight. Grup market jadi triple (A win, draw, B win), hitung sum
+  per timestamp, report distribusi + arb instances.
 
 ## Roadmap fase
 
@@ -34,7 +37,7 @@ ada tebakan outcome — cuma eksploit inkonsistensi harga yang matematis.
 | 1.2   | `market_discovery.py` — smart market filter CLI | ✅ |
 | 1.3   | `snapshot.py` — orderbook snapshot + parquet storage | ✅ |
 | 1.4   | `poll_loop.py` — periodic snapshot service | ✅ |
-| 2     | Query explorer via DuckDB | belum |
+| 2     | `analyze_type2.py` — Type-2 arb analysis (three-way sum) | ✅ |
 | 3     | Wallet + execution layer (paper + live behind flag) | belum |
 | 4     | Risk guards + monitoring | belum |
 | 5     | Backtest harness generic | belum |
@@ -303,6 +306,32 @@ SELECT ROUND(book_sum, 3) AS sum_bucket, COUNT(*) AS n
 FROM read_parquet('data/snapshots/**/*.parquet')
 GROUP BY sum_bucket ORDER BY sum_bucket;
 ```
+
+## Phase 2: `analyze_type2.py`
+
+Analisis data overnight untuk **Type-2 (three-way sum) arbitrage**. Untuk
+market olahraga dengan 3 outcome (A menang, seri, B menang), total harga
+YES_ask ketiga market seharusnya = $1.00. Kalau sum < $1.00, beli ketiga
+YES token = guaranteed profit saat resolusi.
+
+```bash
+# default: baca dari data/snapshots/, tanpa fee
+python analyze_type2.py
+
+# custom data dir
+python analyze_type2.py --data-dir /path/to/snapshots
+
+# dengan asumsi fee 2%
+python analyze_type2.py --fee-bps 200
+```
+
+Script akan:
+
+1. Load semua parquet dari `data/snapshots/`
+2. Identifikasi "draw" markets (question contains "end in a draw")
+3. Parse team names → grup market jadi match triple
+4. Untuk tiap triple tiap timestamp, hitung three-way sum
+5. Report distribusi, arb instances, dan match-level stats
 
 ## Catatan `fetch_data.py`
 
