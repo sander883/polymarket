@@ -445,13 +445,13 @@ class PolymarketClient:
         offset: int = 0,
         active: bool = True,
         closed: bool = False,
-        order: str = "liquidityNum",
-        ascending: bool = False,
     ) -> list[dict[str, Any]]:
         """Fetch events from Gamma /events endpoint.
 
         Events group related markets (e.g. all BTC price targets for one
         time window). Returns raw event dicts — each has a "markets" list.
+
+        Note: /events does NOT support order=liquidityNum (that's /markets only).
 
         Args:
             tag_id: filter by tag (21 = Crypto).
@@ -462,8 +462,6 @@ class PolymarketClient:
             "offset": str(offset),
             "active": "true" if active else "false",
             "closed": "true" if closed else "false",
-            "order": order,
-            "ascending": "true" if ascending else "false",
         }
         if tag_id is not None:
             params["tag_id"] = str(tag_id)
