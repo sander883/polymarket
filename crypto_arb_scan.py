@@ -30,7 +30,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import ccxt
 
@@ -55,6 +55,160 @@ STRIKE_PATTERN = re.compile(
 # Direction: above/over/reach/hit = bullish, below/under = bearish
 DIRECTION_PATTERN = re.compile(r"\b(above|over|below|under|reach|hit|exceed)\b", re.IGNORECASE)
 
+# Questions that match STRIKE_PATTERN but aren't BTC *price* markets
+# e.g. "Bitcoin realized volatility index hit 70", "Bitcoin dominance above 60%"
+NON_PRICE_KEYWORDS = re.compile(
+    r"\b(volatility|dominance|market\s*cap|hash\s*rate|difficulty|"
+    r"fear\s*(?:and|&)\s*greed|index|sentiment|etf\s*flow)\b",
+    re.IGNORECASE,
+)
+
+# Minimum plausible BTC strike price — anything below this is not a price market
+MIN_BTC_STRIKE = 10_000
+
+# ---------------------------------------------------------------------------
+# Expiry / time-to-resolution parsing
+# ---------------------------------------------------------------------------
+
+# Patterns for extracting resolution time from question text
+# "... at 10:00 AM ET?"  (hourly/sub-hourly)
+TIME_PATTERN = re.compile(
+    r"at\s+(\d{1,2}):(\d{2})\s*(AM|PM)\s*ET",
+    re.IGNORECASE,
+)
+
+# "... on April 13?"  or  "... on 2026-04-13?"
+DATE_PATTERN = re.compile(
+    r"on\s+(?:(\w+)\s+(\d{1,2})(?:,?\s*(\d{4}))?|(\d{4})-(\d{2})-(\d{2}))",
+    re.IGNORECASE,
+)
+
+# "... by April 30?"  "... by December 31, 2026?"
+BY_DATE_PATTERN = re.compile(
+    r"by\s+(?:(\w+)\s+(\d{1,2})(?:,?\s*(\d{4}))?|(\d{4})-(\d{2})-(\d{2}))",
+    re.IGNORECASE,
+)
+
+# "... in April?"  "... in April 2026?"
+_MONTH_NAMES = "january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
+IN_PERIOD_PATTERN = re.compile(
+    rf"in\s+({_MONTH_NAMES})(?:\s+(\d{{4}}))?",
+    re.IGNORECASE,
+)
+
+MONTH_MAP = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def parse_expiry(question: str) -> datetime | None:
+    """Try to extract the resolution/expiry datetime from a question.
+
+    Returns a UTC datetime, or None if unparseable.
+    ET (Eastern Time) is assumed UTC-4 (EDT) for simplicity.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Try "at HH:MM AM/PM ET" (intraday markets — the latency arb targets)
+    time_m = TIME_PATTERN.search(question)
+    date_m = DATE_PATTERN.search(question)
+
+    if time_m:
+        hour = int(time_m.group(1))
+        minute = int(time_m.group(2))
+        ampm = time_m.group(3).upper()
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+        # ET -> UTC (EDT = UTC-4)
+        utc_hour = hour + 4
+
+        # figure out the date
+        if date_m:
+            if date_m.group(4):  # ISO format
+                year = int(date_m.group(4))
+                month = int(date_m.group(5))
+                day = int(date_m.group(6))
+            else:
+                month_name = date_m.group(1).lower()
+                month = MONTH_MAP.get(month_name, now.month)
+                day = int(date_m.group(2))
+                year = int(date_m.group(3)) if date_m.group(3) else now.year
+        else:
+            # time but no date — assume today
+            year, month, day = now.year, now.month, now.day
+
+        try:
+            expiry = datetime(year, month, day, tzinfo=timezone.utc) + timedelta(hours=utc_hour, minutes=minute)
+            return expiry
+        except ValueError:
+            pass
+
+    # "on April 13" (daily market, no specific time — assume end of day ET = 23:59 ET = 03:59 UTC next day)
+    if date_m and not time_m:
+        if date_m.group(4):  # ISO
+            year = int(date_m.group(4))
+            month = int(date_m.group(5))
+            day = int(date_m.group(6))
+        else:
+            month_name = date_m.group(1).lower()
+            month = MONTH_MAP.get(month_name, now.month)
+            day = int(date_m.group(2))
+            year = int(date_m.group(3)) if date_m.group(3) else now.year
+        try:
+            # end of day ET ≈ 04:00 UTC next day
+            return datetime(year, month, day, 23, 59, tzinfo=timezone.utc) + timedelta(hours=4)
+        except ValueError:
+            pass
+
+    # "by December 31, 2026" — long-dated
+    by_m = BY_DATE_PATTERN.search(question)
+    if by_m:
+        if by_m.group(4):
+            year = int(by_m.group(4))
+            month = int(by_m.group(5))
+            day = int(by_m.group(6))
+        else:
+            month_name = by_m.group(1).lower()
+            month = MONTH_MAP.get(month_name, now.month)
+            day = int(by_m.group(2))
+            year = int(by_m.group(3)) if by_m.group(3) else now.year
+        try:
+            return datetime(year, month, day, 23, 59, tzinfo=timezone.utc) + timedelta(hours=4)
+        except ValueError:
+            pass
+
+    # "in April" — end of month
+    in_m = IN_PERIOD_PATTERN.search(question)
+    if in_m:
+        month_name = in_m.group(1).lower()
+        month = MONTH_MAP.get(month_name)
+        if month:
+            year = int(in_m.group(2)) if in_m.group(2) else now.year
+            # last day of month
+            if month == 12:
+                expiry = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            else:
+                expiry = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+            return expiry
+
+    return None
+
+
+def hours_to_expiry(question: str) -> float | None:
+    """Return hours until market resolution, or None if unparseable."""
+    expiry = parse_expiry(question)
+    if expiry is None:
+        return None
+    now = datetime.now(timezone.utc)
+    delta = (expiry - now).total_seconds() / 3600
+    return delta
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -74,6 +228,7 @@ class CryptoMarket:
     no_bid: float
     yes_ask_size: float
     no_ask_size: float
+    hours_to_expiry: float | None = None  # None = couldn't parse
 
 
 @dataclass
@@ -110,7 +265,12 @@ def parse_strike(question: str) -> tuple[float, str] | None:
     """Extract strike price and direction from a Polymarket question.
 
     Returns (strike_price, direction) or None if not parseable.
+    Filters out non-price markets (volatility index, dominance, etc.).
     """
+    # Reject non-price markets before even trying to parse
+    if NON_PRICE_KEYWORDS.search(question):
+        return None
+
     strike_match = STRIKE_PATTERN.search(question)
     if not strike_match:
         return None
@@ -122,6 +282,10 @@ def parse_strike(question: str) -> tuple[float, str] | None:
         else:
             strike = float(raw_strike)
     except ValueError:
+        return None
+
+    # Reject implausibly low strikes (volatility=70, dominance=60%, etc.)
+    if strike < MIN_BTC_STRIKE:
         return None
 
     dir_match = DIRECTION_PATTERN.search(question)
@@ -256,6 +420,8 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
         yes_ask_size = yes_book.best_ask.size if yes_book and yes_book.best_ask else 0.0
         no_ask_size = no_book.best_ask.size if no_book and no_book.best_ask else 0.0
 
+        hte = hours_to_expiry(m.question)
+
         if yes_ask > 0 or no_ask > 0:
             crypto_markets.append(CryptoMarket(
                 market=m,
@@ -267,67 +433,119 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                 no_bid=no_bid,
                 yes_ask_size=yes_ask_size,
                 no_ask_size=no_ask_size,
+                hours_to_expiry=hte,
             ))
 
     print(f"  Markets with orderbook: {len(crypto_markets)}")
 
-    # 5. Detect mispricings
+    # Classify by expiry
+    near_expiry = [cm for cm in crypto_markets if cm.hours_to_expiry is not None and cm.hours_to_expiry <= 6]
+    today_expiry = [cm for cm in crypto_markets if cm.hours_to_expiry is not None and 6 < cm.hours_to_expiry <= 24]
+    far_expiry = [cm for cm in crypto_markets if cm.hours_to_expiry is None or cm.hours_to_expiry > 24]
+    print(f"  Near-expiry (≤6h): {len(near_expiry)}  "
+          f"Today (6-24h): {len(today_expiry)}  "
+          f"Far (>24h): {len(far_expiry)}")
+
+    # 5. Detect mispricings — TIME-AWARE
+    #
+    # Latency arb thesis: Polymarket prices lag Binance by 30-90 seconds.
+    # This is only exploitable on NEAR-EXPIRY markets where BTC is clearly
+    # past the strike and the market should be pricing near 0 or 1.
+    #
+    # For multi-day/monthly markets, odds reflect genuine uncertainty about
+    # future price — NOT a lagging signal. Those are excluded.
+    #
+    # Thresholds scale with time-to-expiry:
+    #   ≤1h:   BTC past strike by 0.3% → fair value ~0.95, very strong signal
+    #   1-6h:  BTC past strike by 1.0% → fair value ~0.90, moderate signal
+    #   6-24h: BTC past strike by 2.0% → fair value ~0.80, weak signal (show but caveat)
+    #   >24h:  SKIP — not latency arb, it's genuine uncertainty
+
     signals: list[ArbSignal] = []
 
     for cm in sorted(crypto_markets, key=lambda c: c.strike_price):
         strike = cm.strike_price
         direction = cm.direction
+        hte = cm.hours_to_expiry
 
         if direction == "up_or_down":
-            # Up/Down market — show prices, no strike comparison
             if verbose:
+                hte_str = f"{hte:.1f}h" if hte is not None else "??h"
                 print(f"  UD  {'':<10}  up/dn  "
                       f"YES={cm.yes_ask:.3f} NO={cm.no_ask:.3f}  "
-                      f"'{cm.market.question[:55]}'")
-            # Up/Down edge: if BTC moved significantly since market open,
-            # and YES (up) or NO (down) is still near 0.50, there's edge.
-            # We can't know the open price from the question alone, so
-            # just report the market for now.
+                      f"exp={hte_str}  "
+                      f"'{cm.market.question[:50]}'")
             continue
 
-        # determine fair direction for strike-based markets
         if strike <= 0:
             continue
 
+        # Skip far-out markets — not latency arb candidates
+        if hte is not None and hte > 24:
+            if verbose:
+                print(f"  SKIP ${strike:>10,.0f} {direction:>5}  "
+                      f"exp={hte:.0f}h (too far out)  "
+                      f"'{cm.market.question[:45]}'")
+            continue
+
+        # Determine thresholds based on time-to-expiry
+        if hte is not None and hte <= 1:
+            # Near-expiry: BTC 0.3% past strike is strong signal
+            distance_threshold = 0.003
+            fair_value_est = 0.95
+            confidence = "HIGH"
+        elif hte is not None and hte <= 6:
+            distance_threshold = 0.01
+            fair_value_est = 0.90
+            confidence = "MEDIUM"
+        elif hte is not None and hte <= 24:
+            distance_threshold = 0.02
+            fair_value_est = 0.80
+            confidence = "LOW"
+        else:
+            # hte is None — couldn't parse expiry. Be conservative.
+            distance_threshold = 0.02
+            fair_value_est = 0.80
+            confidence = "LOW (expiry unknown)"
+
         if direction == "above":
             distance_pct = (btc_price - strike) / strike * 100
-        else:  # "below"
+        else:
             distance_pct = (strike - btc_price) / strike * 100
+
+        hte_str = f"{hte:.1f}h" if hte is not None else "??h"
 
         if verbose:
             above_strike = btc_price > strike if direction == "above" else btc_price < strike
             tag = ">>>" if above_strike else "   "
             print(f"  {tag} ${strike:>10,.0f} {direction:>5}  "
                   f"YES={cm.yes_ask:.3f} NO={cm.no_ask:.3f}  "
-                  f"BTC dist={distance_pct:+.2f}%  "
-                  f"'{cm.market.question[:50]}'")
+                  f"BTC dist={distance_pct:+.2f}%  exp={hte_str}  "
+                  f"'{cm.market.question[:45]}'")
 
-        # Check for mispricings:
+        # Check for mispricings
         if direction == "above":
-            if btc_price > strike * 1.005:  # BTC > strike+0.5% → YES should be high
-                if cm.yes_ask < 0.85 and cm.yes_ask > 0:
-                    edge = 0.95 - cm.yes_ask
+            if btc_price > strike * (1 + distance_threshold):
+                # BTC above strike → YES should be high
+                if cm.yes_ask < fair_value_est and cm.yes_ask > 0:
+                    edge = fair_value_est - cm.yes_ask
                     signals.append(ArbSignal(
                         crypto_market=cm,
                         binance_price=btc_price,
-                        fair_value="YES should be HIGH (BTC already above strike)",
+                        fair_value=f"YES ~{fair_value_est:.0%} [{confidence}, exp={hte_str}]",
                         poly_yes_ask=cm.yes_ask,
                         poly_no_ask=cm.no_ask,
                         edge_description=f"buy YES @ {cm.yes_ask:.3f}, BTC ${btc_price:,.0f} > strike ${strike:,.0f}",
                         edge_pct=edge * 100,
                     ))
-            elif btc_price < strike * 0.995:  # BTC < strike-0.5% → NO should be high
-                if cm.no_ask < 0.85 and cm.no_ask > 0:
-                    edge = 0.95 - cm.no_ask
+            elif btc_price < strike * (1 - distance_threshold):
+                # BTC below strike → NO should be high
+                if cm.no_ask < fair_value_est and cm.no_ask > 0:
+                    edge = fair_value_est - cm.no_ask
                     signals.append(ArbSignal(
                         crypto_market=cm,
                         binance_price=btc_price,
-                        fair_value="NO should be HIGH (BTC already below strike)",
+                        fair_value=f"NO ~{fair_value_est:.0%} [{confidence}, exp={hte_str}]",
                         poly_yes_ask=cm.yes_ask,
                         poly_no_ask=cm.no_ask,
                         edge_description=f"buy NO @ {cm.no_ask:.3f}, BTC ${btc_price:,.0f} < strike ${strike:,.0f}",
@@ -357,7 +575,9 @@ def print_report(signals: list[ArbSignal], btc_price: float) -> None:
     print(f"\n  {len(signals)} potential mispricings found!\n")
 
     for s in sorted(signals, key=lambda x: -x.edge_pct):
-        print(f"  *** EDGE: {s.edge_pct:+.1f}% ***")
+        hte = s.crypto_market.hours_to_expiry
+        hte_str = f"{hte:.1f}h" if hte is not None else "unknown"
+        print(f"  *** EDGE: {s.edge_pct:+.1f}%  (expiry: {hte_str}) ***")
         print(f"  Market: {s.crypto_market.market.question[:70]}")
         print(f"  Strike: ${s.crypto_market.strike_price:,.0f}  "
               f"Direction: {s.crypto_market.direction}")
