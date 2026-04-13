@@ -70,8 +70,10 @@ def find_match_groups(
     incomplete = 0
 
     for draw_q, (team_a, team_b) in draw_markets.items():
-        a_wins = [q for q in questions if q.startswith(f"Will {team_a} win")]
-        b_wins = [q for q in questions if q.startswith(f"Will {team_b} win")]
+        # require BOTH team names to avoid cross-match contamination
+        # (e.g., "Will Leeds win vs Wolverhampton" not "Will Leeds win vs Chelsea")
+        a_wins = [q for q in questions if q.startswith(f"Will {team_a} win") and team_b in q]
+        b_wins = [q for q in questions if q.startswith(f"Will {team_b} win") and team_a in q]
 
         if a_wins and b_wins:
             key = f"{team_a} vs {team_b}"

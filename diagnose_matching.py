@@ -76,8 +76,9 @@ def main() -> int:
             print(f"    - {q}{marker}")
 
         # check: does startswith pick the RIGHT one?
-        a_wins = [q for q in questions if q.startswith(f"Will {team_a} win")]
-        b_wins = [q for q in questions if q.startswith(f"Will {team_b} win")]
+        # fixed: require both team names to avoid cross-match contamination
+        a_wins = [q for q in questions if q.startswith(f"Will {team_a} win") and team_b in q]
+        b_wins = [q for q in questions if q.startswith(f"Will {team_b} win") and team_a in q]
 
         if len(a_wins) > 1:
             print(f"\n  *** BUG: {len(a_wins)} questions match 'Will {team_a} win...' ***")
