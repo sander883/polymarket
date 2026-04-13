@@ -45,14 +45,15 @@ logger = logging.getLogger(__name__)
 
 # Regex patterns for extracting strike prices from Polymarket questions
 # "Will BTC be above $85,000 at ..."
-# "Will Bitcoin be above $84,500 on ..."
+# "Will Bitcoin reach $150,000 in April?"
+# "Bitcoin above $84k?"
 STRIKE_PATTERN = re.compile(
-    r"(?:BTC|Bitcoin).*?(?:above|below|over|under)\s*\$?([\d,]+(?:\.\d+)?)",
+    r"(?:BTC|Bitcoin).*?(?:above|below|over|under|reach|hit|exceed)\s*\$?([\d,]+(?:\.\d+)?(?:k|K)?)",
     re.IGNORECASE,
 )
 
-# Direction: above/over = bullish, below/under = bearish
-DIRECTION_PATTERN = re.compile(r"\b(above|over|below|under)\b", re.IGNORECASE)
+# Direction: above/over/reach/hit = bullish, below/under = bearish
+DIRECTION_PATTERN = re.compile(r"\b(above|over|below|under|reach|hit|exceed)\b", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -115,14 +116,18 @@ def parse_strike(question: str) -> tuple[float, str] | None:
         return None
 
     try:
-        strike = float(strike_match.group(1).replace(",", ""))
+        raw_strike = strike_match.group(1).replace(",", "")
+        if raw_strike.lower().endswith("k"):
+            strike = float(raw_strike[:-1]) * 1000
+        else:
+            strike = float(raw_strike)
     except ValueError:
         return None
 
     dir_match = DIRECTION_PATTERN.search(question)
     if dir_match:
         word = dir_match.group(1).lower()
-        direction = "above" if word in ("above", "over") else "below"
+        direction = "above" if word in ("above", "over", "reach", "hit", "exceed") else "below"
     else:
         direction = "above"  # default assumption
 
@@ -141,12 +146,19 @@ async def fetch_crypto_markets(
     # fetch broader set — crypto markets might have lower liquidity
     markets = await client.get_markets(limit=200, min_liquidity=100)
 
-    # first pass: find anything crypto-related
-    crypto_keywords = ["btc", "bitcoin", "crypto", "eth", "ethereum", "sol", "solana"]
+    # first pass: find anything crypto-related (word boundary to avoid "Hegseth" matching "eth")
+    crypto_patterns = [
+        re.compile(r"\bbtc\b", re.IGNORECASE),
+        re.compile(r"\bbitcoin\b", re.IGNORECASE),
+        re.compile(r"\bcrypto\b", re.IGNORECASE),
+        re.compile(r"\beth\b", re.IGNORECASE),
+        re.compile(r"\bethereum\b", re.IGNORECASE),
+        re.compile(r"\bsol\b", re.IGNORECASE),
+        re.compile(r"\bsolana\b", re.IGNORECASE),
+    ]
     crypto_questions = []
     for m in markets:
-        q = m.question.lower()
-        if any(kw in q for kw in crypto_keywords):
+        if any(p.search(m.question) for p in crypto_patterns):
             crypto_questions.append(m)
 
     if verbose:
@@ -170,6 +182,16 @@ async def fetch_crypto_markets(
         parsed = parse_strike(m.question)
         if parsed:
             crypto.append((m, parsed[0], parsed[1]))
+
+    # third pass: "Up or Down" markets (no strike, direction-only)
+    # These resolve based on BTC price at market open vs close
+    # We track them separately — edge comes from momentum, not strike
+    up_down_pattern = re.compile(r"(?:BTC|Bitcoin)\s+Up or Down", re.IGNORECASE)
+    for m in crypto_questions:
+        if up_down_pattern.search(m.question) and m not in [c[0] for c in crypto]:
+            # use current BTC price as "strike" — YES=up, NO=down
+            # the real reference is the market open price, but we approximate
+            crypto.append((m, 0.0, "up_or_down"))
 
     return crypto
 
@@ -247,35 +269,40 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
         strike = cm.strike_price
         direction = cm.direction
 
-        # determine fair direction
+        if direction == "up_or_down":
+            # Up/Down market — show prices, no strike comparison
+            if verbose:
+                print(f"  UD  {'':<10}  up/dn  "
+                      f"YES={cm.yes_ask:.3f} NO={cm.no_ask:.3f}  "
+                      f"'{cm.market.question[:55]}'")
+            # Up/Down edge: if BTC moved significantly since market open,
+            # and YES (up) or NO (down) is still near 0.50, there's edge.
+            # We can't know the open price from the question alone, so
+            # just report the market for now.
+            continue
+
+        # determine fair direction for strike-based markets
+        if strike <= 0:
+            continue
+
         if direction == "above":
-            btc_above = btc_price > strike
-            btc_below = btc_price < strike
             distance_pct = (btc_price - strike) / strike * 100
         else:  # "below"
-            btc_above = btc_price < strike
-            btc_below = btc_price > strike
             distance_pct = (strike - btc_price) / strike * 100
 
         if verbose:
-            tag = ">>>" if btc_above else "   "
+            above_strike = btc_price > strike if direction == "above" else btc_price < strike
+            tag = ">>>" if above_strike else "   "
             print(f"  {tag} ${strike:>10,.0f} {direction:>5}  "
                   f"YES={cm.yes_ask:.3f} NO={cm.no_ask:.3f}  "
                   f"BTC dist={distance_pct:+.2f}%  "
                   f"'{cm.market.question[:50]}'")
 
         # Check for mispricings:
-        # If BTC is clearly above strike and direction="above":
-        #   YES should be high (~0.90+), NO should be low (~0.10-)
-        #   If YES_ask is still low → buy YES cheap
-        # If BTC is clearly below strike and direction="above":
-        #   YES should be low, NO should be high
-        #   If NO_ask is still low → buy NO cheap
-
         if direction == "above":
             if btc_price > strike * 1.005:  # BTC > strike+0.5% → YES should be high
                 if cm.yes_ask < 0.85 and cm.yes_ask > 0:
-                    edge = 0.95 - cm.yes_ask  # fair ~0.95 for well-above
+                    edge = 0.95 - cm.yes_ask
                     signals.append(ArbSignal(
                         crypto_market=cm,
                         binance_price=btc_price,
