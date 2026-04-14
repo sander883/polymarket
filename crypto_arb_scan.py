@@ -63,6 +63,13 @@ NON_PRICE_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# "hit $60k or $80k first?" / "$X or $Y" — multi-outcome "which first" markets
+# These are NOT standard above/below markets, must be excluded
+WHICH_FIRST_PATTERN = re.compile(
+    r"\$[\d,]+k?\s+or\s+\$[\d,]+k?\s+first",
+    re.IGNORECASE,
+)
+
 # Minimum plausible BTC strike price — anything below this is not a price market
 MIN_BTC_STRIKE = 10_000
 
@@ -89,6 +96,12 @@ BY_DATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# "... April 13-19?"  (date range = multi-day market)
+DATE_RANGE_PATTERN = re.compile(
+    r"(\w+)\s+(\d{1,2})\s*-\s*(\d{1,2})(?:,?\s*(\d{4}))?",
+    re.IGNORECASE,
+)
+
 # "... in April?"  "... in April 2026?"
 _MONTH_NAMES = "january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
 IN_PERIOD_PATTERN = re.compile(
@@ -109,9 +122,24 @@ def parse_expiry(question: str) -> datetime | None:
     """Try to extract the resolution/expiry datetime from a question.
 
     Returns a UTC datetime, or None if unparseable.
+
+    Checks date ranges first (e.g. "April 13-19" = end of day April 19).
     ET (Eastern Time) is assumed UTC-4 (EDT) for simplicity.
     """
     now = datetime.now(timezone.utc)
+
+    # Check date range first: "April 13-19" → end of day April 19
+    range_m = DATE_RANGE_PATTERN.search(question)
+    if range_m:
+        month_name = range_m.group(1).lower()
+        month = MONTH_MAP.get(month_name)
+        if month is not None:
+            end_day = int(range_m.group(3))
+            year = int(range_m.group(4)) if range_m.group(4) else now.year
+            try:
+                return datetime(year, month, end_day, 23, 59, tzinfo=timezone.utc) + timedelta(hours=4)
+            except ValueError:
+                pass
 
     # Try "at HH:MM AM/PM ET" (intraday markets — the latency arb targets)
     time_m = TIME_PATTERN.search(question)
@@ -439,6 +467,10 @@ def parse_strike(question: str) -> tuple[float, str] | None:
     if NON_PRICE_KEYWORDS.search(question):
         return None
 
+    # Reject "which first" markets: "hit $60k or $80k first?"
+    if WHICH_FIRST_PATTERN.search(question):
+        return None
+
     strike_match = STRIKE_PATTERN.search(question)
     if not strike_match:
         return None
@@ -759,8 +791,18 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
         if strike <= 0:
             continue
 
+        # Skip markets we can't time — if expiry is unknown, it's likely
+        # a special format (weekly, "which first", multi-outcome) that
+        # isn't suitable for latency arb
+        if hte is None:
+            if verbose:
+                print(f"  SKIP ${strike:>10,.0f} {direction:>5}  "
+                      f"exp=?? (can't parse expiry)  "
+                      f"'{cm.market.question[:45]}'")
+            continue
+
         # Skip far-out markets — not latency arb candidates
-        if hte is not None and hte > 24:
+        if hte > 24:
             if verbose:
                 print(f"  SKIP ${strike:>10,.0f} {direction:>5}  "
                       f"exp={hte:.0f}h (too far out)  "
@@ -768,24 +810,19 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
             continue
 
         # Determine thresholds based on time-to-expiry
-        if hte is not None and hte <= 1:
+        if hte <= 1:
             # Near-expiry: BTC 0.3% past strike is strong signal
             distance_threshold = 0.003
             fair_value_est = 0.95
             confidence = "HIGH"
-        elif hte is not None and hte <= 6:
+        elif hte <= 6:
             distance_threshold = 0.01
             fair_value_est = 0.90
             confidence = "MEDIUM"
-        elif hte is not None and hte <= 24:
+        elif hte <= 24:
             distance_threshold = 0.02
             fair_value_est = 0.80
             confidence = "LOW"
-        else:
-            # hte is None — couldn't parse expiry. Be conservative.
-            distance_threshold = 0.02
-            fair_value_est = 0.80
-            confidence = "LOW (expiry unknown)"
 
         if direction == "above":
             distance_pct = (btc_price - strike) / strike * 100
