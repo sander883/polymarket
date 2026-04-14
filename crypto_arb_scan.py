@@ -885,16 +885,47 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
 # ---------------------------------------------------------------------------
 
 
+SIGNAL_LOG = "signals.log"
+
+# WIB = UTC+7
+WIB = timezone(timedelta(hours=7))
+
+
+def _wib_now() -> str:
+    """Current time in WIB (UTC+7) as HH:MM:SS."""
+    return datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+
+
+def log_signal(signal: ArbSignal) -> None:
+    """Append a signal to signals.log for easy 24/7 review."""
+    ts = _wib_now()
+    cm = signal.crypto_market
+    hte = cm.hours_to_expiry
+    hte_str = f"{hte:.1f}h" if hte is not None else "??"
+    line = (
+        f"[{ts}] EDGE={signal.edge_pct:+.1f}% | "
+        f"exp={hte_str} | "
+        f"BTC=${signal.binance_price:,.0f} | "
+        f"{signal.edge_description} | "
+        f"sz_yes={cm.yes_ask_size:.0f} sz_no={cm.no_ask_size:.0f} | "
+        f"{cm.market.question[:60]}\n"
+    )
+    try:
+        with open(SIGNAL_LOG, "a") as f:
+            f.write(line)
+    except OSError:
+        pass  # don't crash the scanner if file write fails
+
+
 def print_report(signals: list[ArbSignal], btc_price: float) -> None:
     """Print scan results."""
+    ts = _wib_now()
     print(f"\n{'=' * 70}")
-    print(f"CRYPTO ARB SCAN RESULTS — BTC=${btc_price:,.2f}")
+    print(f"CRYPTO ARB SCAN — BTC=${btc_price:,.2f} — {ts}")
     print(f"{'=' * 70}")
 
     if not signals:
-        print("\n  No mispricings detected.")
-        print("  Polymarket prices are in line with current Binance BTC price.")
-        print("  This is expected when markets are not moving fast.")
+        print("  No mispricings detected. Markets in line with Binance.")
         return
 
     print(f"\n  {len(signals)} potential mispricings found!\n")
@@ -913,6 +944,9 @@ def print_report(signals: list[ArbSignal], btc_price: float) -> None:
         print(f"  Action:  {s.edge_description}")
         print()
 
+        # Auto-log every signal to file
+        log_signal(s)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -921,7 +955,10 @@ def print_report(signals: list[ArbSignal], btc_price: float) -> None:
 
 async def run_loop(interval: float, verbose: bool) -> None:
     """Continuous scanning loop."""
+    ts = _wib_now()
     print(f"Starting crypto arb scanner (interval={interval}s)")
+    print(f"Time: {ts}")
+    print(f"Signals auto-logged to: {SIGNAL_LOG}")
     print(f"Press Ctrl-C to stop.\n")
 
     cycle = 0
@@ -930,8 +967,9 @@ async def run_loop(interval: float, verbose: bool) -> None:
     try:
         while True:
             cycle += 1
-            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            print(f"[{ts}] Cycle {cycle}")
+            ts_wib = datetime.now(WIB).strftime("%H:%M:%S")
+            ts_utc = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            print(f"[{ts_wib} WIB / {ts_utc} UTC] Cycle {cycle}")
 
             try:
                 signals = await scan_once(verbose=verbose)
@@ -940,7 +978,10 @@ async def run_loop(interval: float, verbose: bool) -> None:
                     btc_price = signals[0].binance_price
                     print_report(signals, btc_price)
                 else:
-                    print(f"  No edge detected.\n")
+                    if verbose:
+                        print(f"  No edge detected.\n")
+                    else:
+                        print(f"  OK — no edge.\n")
             except Exception as exc:
                 logger.warning("scan error: %s", exc)
                 print(f"  Error: {exc}\n")
@@ -948,7 +989,9 @@ async def run_loop(interval: float, verbose: bool) -> None:
             await asyncio.sleep(interval)
 
     except KeyboardInterrupt:
-        print(f"\n\nStopped. {cycle} cycles, {total_signals} total signals.")
+        print(f"\n\nStopped at {_wib_now()}. {cycle} cycles, {total_signals} total signals.")
+        if total_signals > 0:
+            print(f"Review signals: cat {SIGNAL_LOG}")
 
 
 async def run_once(verbose: bool) -> int:
