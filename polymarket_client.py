@@ -557,6 +557,14 @@ class PolymarketClient:
             try:
                 book = await self.get_orderbook(tid)
                 return tid, book
+            except PolymarketAPIError as exc:
+                # 404 = token doesn't exist on CLOB (common with events-based
+                # discovery where markets may be closed/pre-launch). Debug only.
+                if exc.status_code == 404:
+                    logger.debug("no CLOB book for %s (404)", tid[:20])
+                else:
+                    logger.warning("orderbook fetch failed for %s: %s", tid, exc)
+                return tid, None
             except PolymarketError as exc:
                 logger.warning("orderbook fetch failed for %s: %s", tid, exc)
                 return tid, None

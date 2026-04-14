@@ -285,28 +285,46 @@ def get_binance_btc_price_at(ts_ms: int) -> float | None:
 
 # "BTC Up or Down - April 13, 4:00 AM ET"
 # "Bitcoin 5 Minute Up or Down - 10:30 AM ET"
+# "Bitcoin Up or Down on April 14?"
 UP_DOWN_PATTERN = re.compile(
-    r"(?:BTC|Bitcoin)\s+(?:(\d+)\s*(?:Minute|Min)\s+)?Up\s+or\s+Down",
+    r"(?:BTC|Bitcoin)\s+(?:(\d+)\s*(?:Minute|Min)\s+)?Up\s+(?:or|and)\s+Down",
     re.IGNORECASE,
 )
 
-# Extract time from Up/Down question: "... 4:00 AM ET" or "... 4AM ET"
+# Range time format: "8:00PM-12:00AM ET" or "8:45PM-9:00PM ET"
+UP_DOWN_RANGE_PATTERN = re.compile(
+    r"(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*-\s*(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*ET",
+    re.IGNORECASE,
+)
+
+# Single time format: "9PM ET" or "4:00 AM ET"
 UP_DOWN_TIME_PATTERN = re.compile(
     r"(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*ET",
     re.IGNORECASE,
 )
 
-# Extract date from Up/Down question: "April 13" or "2026-04-13"
+# Extract date from Up/Down question: "April 13" or "on April 14"
 UP_DOWN_DATE_PATTERN = re.compile(
     r"(?:(\w+)\s+(\d{1,2})(?:,?\s*(\d{4}))?)",
     re.IGNORECASE,
 )
 
 
+def _et_to_utc_hour_min(hour: int, minute: int, ampm: str) -> tuple[int, int]:
+    """Convert ET hour/minute/AMPM to UTC hour/minute."""
+    if ampm == "PM" and hour != 12:
+        hour += 12
+    elif ampm == "AM" and hour == 12:
+        hour = 0
+    # EDT = UTC-4
+    utc_hour = hour + 4
+    return utc_hour, minute
+
+
 @dataclass
 class UpDownInfo:
     """Parsed info for an Up/Down market."""
-    window_minutes: int          # 5, 15, 60, etc.
+    window_minutes: int          # 5, 15, 60, 240, etc.
     window_start_utc: datetime   # start of the resolution window
     window_end_utc: datetime     # end of the resolution window
     open_price: float | None     # BTC price at window start (fetched from Binance)
@@ -316,58 +334,94 @@ class UpDownInfo:
 def parse_up_down(question: str) -> UpDownInfo | None:
     """Parse an Up/Down market question into window timing.
 
-    Returns UpDownInfo or None if not an Up/Down market.
+    Handles multiple formats:
+      "Bitcoin Up or Down - April 13, 9PM ET"           → hourly (9PM-10PM)
+      "Bitcoin Up or Down - April 13, 8:00PM-12:00AM ET" → range (4 hours)
+      "Bitcoin Up or Down - April 13, 8:45PM-9:00PM ET"  → range (15 min)
+      "BTC 5 Minute Up or Down - April 13, 4:00 AM ET"   → explicit 5 min
+      "Bitcoin Up or Down on April 14?"                   → daily (skip)
+
+    Returns UpDownInfo or None if not parseable.
     """
     ud_match = UP_DOWN_PATTERN.search(question)
     if not ud_match:
         return None
 
-    # Window duration: default 5 min if not specified
-    duration_str = ud_match.group(1)
-    window_minutes = int(duration_str) if duration_str else 5
+    # Explicit duration in question text: "5 Minute", "15 Minute"
+    explicit_duration = ud_match.group(1)
 
-    # Parse the time
-    time_m = UP_DOWN_TIME_PATTERN.search(question)
-    if not time_m:
-        return None
-
-    hour = int(time_m.group(1))
-    minute = int(time_m.group(2) or "0")
-    ampm = time_m.group(3).upper()
-    if ampm == "PM" and hour != 12:
-        hour += 12
-    elif ampm == "AM" and hour == 12:
-        hour = 0
-
-    # ET -> UTC (EDT = UTC-4)
-    utc_hour = hour + 4
-
-    # Parse the date
     now = datetime.now(timezone.utc)
-    date_m = UP_DOWN_DATE_PATTERN.search(question)
-    if date_m:
+
+    # Parse the date — find a match with a valid month name
+    year, month, day = now.year, now.month, now.day
+    for date_m in UP_DOWN_DATE_PATTERN.finditer(question):
         month_name = date_m.group(1).lower()
-        month = MONTH_MAP.get(month_name, now.month)
-        day = int(date_m.group(2))
-        year = int(date_m.group(3)) if date_m.group(3) else now.year
-    else:
-        year, month, day = now.year, now.month, now.day
+        parsed_month = MONTH_MAP.get(month_name)
+        if parsed_month is not None:
+            month = parsed_month
+            day = int(date_m.group(2))
+            year = int(date_m.group(3)) if date_m.group(3) else now.year
+            break
 
-    try:
-        window_start = datetime(year, month, day, tzinfo=timezone.utc) + timedelta(hours=utc_hour, minutes=minute)
-        window_end = window_start + timedelta(minutes=window_minutes)
-    except ValueError:
-        return None
+    # Try range format first: "8:00PM-12:00AM ET"
+    range_m = UP_DOWN_RANGE_PATTERN.search(question)
+    if range_m:
+        start_h, start_min = _et_to_utc_hour_min(
+            int(range_m.group(1)), int(range_m.group(2) or "0"), range_m.group(3).upper()
+        )
+        end_h, end_min = _et_to_utc_hour_min(
+            int(range_m.group(4)), int(range_m.group(5) or "0"), range_m.group(6).upper()
+        )
+        try:
+            window_start = datetime(year, month, day, tzinfo=timezone.utc) + timedelta(hours=start_h, minutes=start_min)
+            window_end = datetime(year, month, day, tzinfo=timezone.utc) + timedelta(hours=end_h, minutes=end_min)
+            # handle midnight crossover (e.g. 8PM-12AM)
+            if window_end <= window_start:
+                window_end += timedelta(days=1)
+            window_minutes = int((window_end - window_start).total_seconds() / 60)
+        except ValueError:
+            return None
 
-    minutes_elapsed = (now - window_start).total_seconds() / 60
+        minutes_elapsed = (now - window_start).total_seconds() / 60
+        return UpDownInfo(
+            window_minutes=window_minutes,
+            window_start_utc=window_start,
+            window_end_utc=window_end,
+            open_price=None,
+            minutes_elapsed=minutes_elapsed,
+        )
 
-    return UpDownInfo(
-        window_minutes=window_minutes,
-        window_start_utc=window_start,
-        window_end_utc=window_end,
-        open_price=None,  # filled later
-        minutes_elapsed=minutes_elapsed,
-    )
+    # Try single time format: "9PM ET" or "4:00 AM ET"
+    time_m = UP_DOWN_TIME_PATTERN.search(question)
+    if time_m:
+        utc_hour, utc_min = _et_to_utc_hour_min(
+            int(time_m.group(1)), int(time_m.group(2) or "0"), time_m.group(3).upper()
+        )
+
+        if explicit_duration:
+            window_minutes = int(explicit_duration)
+        else:
+            # No explicit duration + single time = hourly window
+            window_minutes = 60
+
+        try:
+            window_start = datetime(year, month, day, tzinfo=timezone.utc) + timedelta(hours=utc_hour, minutes=utc_min)
+            window_end = window_start + timedelta(minutes=window_minutes)
+        except ValueError:
+            return None
+
+        minutes_elapsed = (now - window_start).total_seconds() / 60
+        return UpDownInfo(
+            window_minutes=window_minutes,
+            window_start_utc=window_start,
+            window_end_utc=window_end,
+            open_price=None,
+            minutes_elapsed=minutes_elapsed,
+        )
+
+    # "Bitcoin Up or Down on April 14?" — daily, no time specified
+    # These are too long for latency arb, return None to skip
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -630,39 +684,51 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                       f"'{cm.market.question[:40]}'")
 
             # Edge detection for Up/Down:
-            # With <2 min left and BTC clearly moved, the market should
-            # be pricing the winning side near 0.80-0.95.
+            # Thresholds scale with fraction of window remaining.
+            # A move with 10% of window left is much more meaningful
+            # than the same move with 80% of window left.
             #
-            # Thresholds scale with time remaining:
-            #   <1 min left: 0.05% move is enough (BTC unlikely to reverse)
-            #   1-2 min left: 0.10% move needed
-            #   2-3 min left: 0.15% move needed
-            #   >3 min left: 0.20% move needed (more time for reversal)
+            # fraction_left = minutes_left / window_minutes
+            #   <5%  left:  0.03% move enough (nearly resolved)
+            #   <15% left:  0.05% move (very strong)
+            #   <30% left:  0.10% move (strong)
+            #   <50% left:  0.15% move (moderate)
+            #   ≥50% left:  0.25% move needed (lots of time for reversal)
 
-            if minutes_left <= 1:
+            fraction_left = minutes_left / ud_info.window_minutes if ud_info.window_minutes > 0 else 1.0
+
+            if fraction_left <= 0.05:
+                move_threshold = 0.03
+                fair_winner = 0.95
+                confidence = "HIGH"
+            elif fraction_left <= 0.15:
                 move_threshold = 0.05
-                fair_winner = 0.92
-            elif minutes_left <= 2:
+                fair_winner = 0.90
+                confidence = "HIGH"
+            elif fraction_left <= 0.30:
                 move_threshold = 0.10
-                fair_winner = 0.85
-            elif minutes_left <= 3:
+                fair_winner = 0.80
+                confidence = "MEDIUM"
+            elif fraction_left <= 0.50:
                 move_threshold = 0.15
-                fair_winner = 0.75
+                fair_winner = 0.70
+                confidence = "MEDIUM"
             else:
-                move_threshold = 0.20
-                fair_winner = 0.65
+                move_threshold = 0.25
+                fair_winner = 0.60
+                confidence = "LOW"
 
             if abs(btc_move_pct) >= move_threshold:
                 # BTC has moved enough — determine which side to buy
+                window_label = f"{ud_info.window_minutes}min"
                 if btc_move_pct > 0:
                     # BTC up → YES should be high
                     if cm.yes_ask < fair_winner and cm.yes_ask > 0:
                         edge = fair_winner - cm.yes_ask
-                        confidence = "HIGH" if minutes_left <= 1 else "MEDIUM" if minutes_left <= 2 else "LOW"
                         signals.append(ArbSignal(
                             crypto_market=cm,
                             binance_price=btc_price,
-                            fair_value=(f"YES ~{fair_winner:.0%} [{confidence}, "
+                            fair_value=(f"YES ~{fair_winner:.0%} [{confidence}, {window_label}, "
                                         f"BTC +{btc_move_pct:.3f}% from open, "
                                         f"{minutes_left:.0f}m left]"),
                             poly_yes_ask=cm.yes_ask,
@@ -675,11 +741,10 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                     # BTC down → NO should be high (NO = "down")
                     if cm.no_ask < fair_winner and cm.no_ask > 0:
                         edge = fair_winner - cm.no_ask
-                        confidence = "HIGH" if minutes_left <= 1 else "MEDIUM" if minutes_left <= 2 else "LOW"
                         signals.append(ArbSignal(
                             crypto_market=cm,
                             binance_price=btc_price,
-                            fair_value=(f"NO ~{fair_winner:.0%} [{confidence}, "
+                            fair_value=(f"NO ~{fair_winner:.0%} [{confidence}, {window_label}, "
                                         f"BTC {btc_move_pct:.3f}% from open, "
                                         f"{minutes_left:.0f}m left]"),
                             poly_yes_ask=cm.yes_ask,
