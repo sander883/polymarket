@@ -78,9 +78,10 @@ MIN_BTC_STRIKE = 10_000
 # ---------------------------------------------------------------------------
 
 # Patterns for extracting resolution time from question text
-# "... at 10:00 AM ET?"  (hourly/sub-hourly)
+# "... at 10:00 AM ET?"  or  "... on April 13, 7PM ET?"  or  "... April 13, 10PM ET?"
+# Matches time with optional "at" — real questions use both formats
 TIME_PATTERN = re.compile(
-    r"at\s+(\d{1,2}):(\d{2})\s*(AM|PM)\s*ET",
+    r"(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*ET",
     re.IGNORECASE,
 )
 
@@ -147,7 +148,7 @@ def parse_expiry(question: str) -> datetime | None:
 
     if time_m:
         hour = int(time_m.group(1))
-        minute = int(time_m.group(2))
+        minute = int(time_m.group(2) or "0")
         ampm = time_m.group(3).upper()
         if ampm == "PM" and hour != 12:
             hour += 12
@@ -798,6 +799,14 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
             if verbose:
                 print(f"  SKIP ${strike:>10,.0f} {direction:>5}  "
                       f"exp=?? (can't parse expiry)  "
+                      f"'{cm.market.question[:45]}'")
+            continue
+
+        # Skip already-resolved markets
+        if hte <= 0:
+            if verbose:
+                print(f"  SKIP ${strike:>10,.0f} {direction:>5}  "
+                      f"exp={hte:.1f}h (already resolved)  "
                       f"'{cm.market.question[:45]}'")
             continue
 
