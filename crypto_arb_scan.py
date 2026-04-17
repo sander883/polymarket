@@ -73,6 +73,10 @@ WHICH_FIRST_PATTERN = re.compile(
 # Minimum plausible BTC strike price — anything below this is not a price market
 MIN_BTC_STRIKE = 10_000
 
+# Minimum ask-side size on the actionable leg. Below this the signal is real
+# but too thin to execute profitably (fees + slippage eat the edge).
+MIN_SIGNAL_SIZE = 200
+
 # ---------------------------------------------------------------------------
 # Expiry / time-to-resolution parsing
 # ---------------------------------------------------------------------------
@@ -756,7 +760,8 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                 window_label = f"{ud_info.window_minutes}min"
                 if btc_move_pct > 0:
                     # BTC up → YES should be high
-                    if cm.yes_ask < fair_winner and cm.yes_ask > 0:
+                    if (cm.yes_ask < fair_winner and cm.yes_ask > 0
+                            and cm.yes_ask_size >= MIN_SIGNAL_SIZE):
                         edge = fair_winner - cm.yes_ask
                         signals.append(ArbSignal(
                             crypto_market=cm,
@@ -772,7 +777,8 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                         ))
                 else:
                     # BTC down → NO should be high (NO = "down")
-                    if cm.no_ask < fair_winner and cm.no_ask > 0:
+                    if (cm.no_ask < fair_winner and cm.no_ask > 0
+                            and cm.no_ask_size >= MIN_SIGNAL_SIZE):
                         edge = fair_winner - cm.no_ask
                         signals.append(ArbSignal(
                             crypto_market=cm,
@@ -852,7 +858,8 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
         if direction == "above":
             if btc_price > strike * (1 + distance_threshold):
                 # BTC above strike → YES should be high
-                if cm.yes_ask < fair_value_est and cm.yes_ask > 0:
+                if (cm.yes_ask < fair_value_est and cm.yes_ask > 0
+                        and cm.yes_ask_size >= MIN_SIGNAL_SIZE):
                     edge = fair_value_est - cm.yes_ask
                     signals.append(ArbSignal(
                         crypto_market=cm,
@@ -865,7 +872,8 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                     ))
             elif btc_price < strike * (1 - distance_threshold):
                 # BTC below strike → NO should be high
-                if cm.no_ask < fair_value_est and cm.no_ask > 0:
+                if (cm.no_ask < fair_value_est and cm.no_ask > 0
+                        and cm.no_ask_size >= MIN_SIGNAL_SIZE):
                     edge = fair_value_est - cm.no_ask
                     signals.append(ArbSignal(
                         crypto_market=cm,
