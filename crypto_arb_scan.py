@@ -900,11 +900,19 @@ def log_signal(signal: ArbSignal) -> None:
     """Append a signal to signals.log for easy 24/7 review."""
     ts = _wib_now()
     cm = signal.crypto_market
-    hte = cm.hours_to_expiry
-    hte_str = f"{hte:.1f}h" if hte is not None else "??"
+    if cm.direction == "up_or_down":
+        ud_info = parse_up_down(cm.market.question)
+        if ud_info is not None:
+            minutes_left = ud_info.window_minutes - ud_info.minutes_elapsed
+            exp_str = f"UD{ud_info.window_minutes}m {minutes_left:.1f}m-left"
+        else:
+            exp_str = "UD-??"
+    else:
+        hte = cm.hours_to_expiry
+        exp_str = f"{hte:.1f}h" if hte is not None else "??"
     line = (
         f"[{ts}] EDGE={signal.edge_pct:+.1f}% | "
-        f"exp={hte_str} | "
+        f"exp={exp_str} | "
         f"BTC=${signal.binance_price:,.0f} | "
         f"{signal.edge_description} | "
         f"sz_yes={cm.yes_ask_size:.0f} sz_no={cm.no_ask_size:.0f} | "
