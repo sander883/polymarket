@@ -74,13 +74,18 @@ WHICH_FIRST_PATTERN = re.compile(
 MIN_BTC_STRIKE = 10_000
 
 # Signals are tiered into two logs:
-#   signals.log   — "actionable": edge >= ACTIONABLE_EDGE_PCT AND size >= ACTIONABLE_SIZE
+#   signals.log   — "actionable": big edge regardless of size, OR decent edge with size
 #   near_miss.log — everything else with a positive edge (diagnostic data)
 # Hard floor below: signals with size < MIN_SIGNAL_SIZE are dropped entirely
 # (they're almost certainly already-filled tails, not real edges).
 MIN_SIGNAL_SIZE = 10
+# Tier 1: huge edge dominates size — worth knowing even if tiny
+HUGE_EDGE_PCT = 10.0
+# Tier 2: normal edge needs decent size
 ACTIONABLE_EDGE_PCT = 3.0
 ACTIONABLE_SIZE = 30
+# Small epsilon so float-precision signals at the boundary aren't demoted
+EDGE_EPS = 0.01
 
 # ---------------------------------------------------------------------------
 # Expiry / time-to-resolution parsing
@@ -821,8 +826,9 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                       f"'{cm.market.question[:45]}'")
             continue
 
-        # Skip far-out markets — not latency arb candidates
-        if hte > 24:
+        # Skip far-out strike markets — beyond 6h it's genuine market opinion
+        # about BTC reaching the strike, not a lagging reaction to Binance
+        if hte > 6:
             if verbose:
                 print(f"  SKIP ${strike:>10,.0f} {direction:>5}  "
                       f"exp={hte:.0f}h (too far out)  "
@@ -835,14 +841,10 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
             distance_threshold = 0.003
             fair_value_est = 0.95
             confidence = "HIGH"
-        elif hte <= 6:
+        else:  # 1h < hte <= 6h
             distance_threshold = 0.01
             fair_value_est = 0.90
             confidence = "MEDIUM"
-        elif hte <= 24:
-            distance_threshold = 0.02
-            fair_value_est = 0.80
-            confidence = "LOW"
 
         if direction == "above":
             distance_pct = (btc_price - strike) / strike * 100
@@ -938,8 +940,12 @@ def log_signal(signal: ArbSignal) -> None:
         exp_str = f"{hte:.1f}h" if hte is not None else "??"
 
     act_size = _actionable_size(signal)
+    edge = signal.edge_pct
+    # Tier 1: huge edge (>=10%) — actionable as long as there's any size at all
+    # Tier 2: decent edge (>=3%) — needs ACTIONABLE_SIZE shares on the leg
     is_actionable = (
-        signal.edge_pct >= ACTIONABLE_EDGE_PCT and act_size >= ACTIONABLE_SIZE
+        (edge >= HUGE_EDGE_PCT - EDGE_EPS and act_size >= MIN_SIGNAL_SIZE)
+        or (edge >= ACTIONABLE_EDGE_PCT - EDGE_EPS and act_size >= ACTIONABLE_SIZE)
     )
     tag = "ACT" if is_actionable else "NM "
     target = SIGNAL_LOG if is_actionable else NEAR_MISS_LOG
