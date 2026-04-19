@@ -952,13 +952,15 @@ def log_signal(signal: ArbSignal) -> None:
     tag = "ACT" if is_actionable else "NM "
     target = SIGNAL_LOG if is_actionable else NEAR_MISS_LOG
 
+    slug = getattr(cm.market, "slug", "") or ""
     line = (
         f"[{ts}] {tag} EDGE={signal.edge_pct:+.1f}% | "
         f"exp={exp_str} | "
         f"BTC=${signal.binance_price:,.0f} | "
         f"{signal.edge_description} | "
         f"sz_yes={cm.yes_ask_size:.0f} sz_no={cm.no_ask_size:.0f} | "
-        f"{cm.market.question[:60]}\n"
+        f"{cm.market.question[:60]} | "
+        f"slug={slug}\n"
     )
     try:
         with open(target, "a") as f:

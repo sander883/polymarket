@@ -65,7 +65,7 @@ LINE_RE = re.compile(
     r"BTC=\$(?P<btc>[\d,]+)\s*\|\s*"
     r"buy\s+(?P<side>YES|NO)\s+@\s+(?P<price>[\d.]+)[^|]*\|\s*"
     r"sz_yes=(?P<sz_yes>[\d.]+)\s+sz_no=(?P<sz_no>[\d.]+)\s*\|\s*"
-    r"(?P<question>.+?)\s*$"
+    r"(?P<question>[^|]+?)(?:\s*\|\s*slug=(?P<slug>\S*))?\s*$"
 )
 
 
@@ -104,6 +104,14 @@ def parse_line(line: str) -> dict | None:
     act_size = float(d["sz_yes"] if side == "YES" else d["sz_no"])
     exp_raw = d["exp"].strip()
     mins_left, window_label = _parse_exp(exp_raw)
+    slug = (d.get("slug") or "").strip()
+    question = d["question"].strip()
+    if slug:
+        market_url = f"https://polymarket.com/event/{slug}"
+    else:
+        # Fallback: Polymarket global search with the question as query
+        from urllib.parse import quote_plus
+        market_url = f"https://polymarket.com/markets?_q={quote_plus(question)}"
     return {
         "ts": d["ts"],
         "tag": d["tag"],
@@ -111,14 +119,16 @@ def parse_line(line: str) -> dict | None:
         "exp": exp_raw,
         "exp_min_left": mins_left,
         "exp_window": window_label,
+        "slug": slug,
+        "market_url": market_url,
         "btc": int(d["btc"].replace(",", "")),
         "side": side,
         "price": price,
         "sz_yes": float(d["sz_yes"]),
         "sz_no": float(d["sz_no"]),
         "act_size": act_size,
-        "question": d["question"],
-        "question_wib": question_to_wib(d["question"]),
+        "question": question,
+        "question_wib": question_to_wib(question),
         "notional_usd": round(act_size * price, 2),
         "potential_profit_usd": round(act_size * (1 - price), 2) if side == "YES" else round(act_size * price * (edge / 100), 2),
     }
@@ -197,6 +207,12 @@ INDEX_HTML = """<!DOCTYPE html>
   .question .q-main { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .question .q-wib  { color: #7dd3fc; font-size: 11.5px; margin-top: 2px;
                       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .question a.q-link { color: inherit; text-decoration: none; display: block;
+                       padding: 2px 0; border-radius: 4px; }
+  .question a.q-link:hover { background: #1b2230; }
+  .question a.q-link:hover .q-main,
+  .question a.q-link:hover .q-wib { text-decoration: underline; }
+  .question .q-ext { font-size: 10px; color: #6a7388; margin-left: 6px; }
   .exp { font-variant-numeric: tabular-nums; white-space: nowrap; }
   .exp-left { font-weight: 600; }
   .exp-left.urgent { color: #f87171; }      /* < 5 min */
@@ -352,9 +368,11 @@ function render() {
       <td class="price">${r.act_size.toFixed(0)}</td>
       <td class="exp">${formatExp(r)}</td>
       <td class="price">$${r.btc.toLocaleString()}</td>
-      <td class="question" title="${r.question}">
-        <div class="q-main">${r.question}</div>
-        ${r.question_wib ? `<div class="q-wib">→ ${r.question_wib}</div>` : ''}
+      <td class="question" title="Klik untuk buka di Polymarket — ${r.question}">
+        <a class="q-link" href="${r.market_url}" target="_blank" rel="noopener">
+          <div class="q-main">${r.question} <span class="q-ext">↗</span></div>
+          ${r.question_wib ? `<div class="q-wib">→ ${r.question_wib}</div>` : ''}
+        </a>
       </td>
     </tr>
   `).join('');
