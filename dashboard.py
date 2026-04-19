@@ -69,6 +69,30 @@ LINE_RE = re.compile(
 )
 
 
+_EXP_UD_RE = re.compile(r"UD(\d+)m\s+([\d.]+)m-left")
+_EXP_H_RE = re.compile(r"([\d.]+)h")
+
+
+def _parse_exp(exp: str) -> tuple[float | None, str | None]:
+    """Return (minutes_left, window_label).
+
+    window_label is human-readable like '5m', '4h', or None for strike.
+    """
+    m = _EXP_UD_RE.match(exp)
+    if m:
+        window_min = int(m.group(1))
+        mins_left = float(m.group(2))
+        if window_min >= 60 and window_min % 60 == 0:
+            window_label = f"{window_min // 60}h"
+        else:
+            window_label = f"{window_min}m"
+        return mins_left, window_label
+    m = _EXP_H_RE.match(exp)
+    if m:
+        return float(m.group(1)) * 60, None
+    return None, None
+
+
 def parse_line(line: str) -> dict | None:
     m = LINE_RE.match(line)
     if not m:
@@ -78,12 +102,15 @@ def parse_line(line: str) -> dict | None:
     price = float(d["price"])
     side = d["side"]
     act_size = float(d["sz_yes"] if side == "YES" else d["sz_no"])
-    max_profit = round(act_size * (1 - price) * (edge / 100) * 10, 2)  # rough dollar est.
+    exp_raw = d["exp"].strip()
+    mins_left, window_label = _parse_exp(exp_raw)
     return {
         "ts": d["ts"],
         "tag": d["tag"],
         "edge": edge,
-        "exp": d["exp"].strip(),
+        "exp": exp_raw,
+        "exp_min_left": mins_left,
+        "exp_window": window_label,
         "btc": int(d["btc"].replace(",", "")),
         "side": side,
         "price": price,
@@ -158,7 +185,13 @@ INDEX_HTML = """<!DOCTYPE html>
   .question .q-main { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .question .q-wib  { color: #7dd3fc; font-size: 11.5px; margin-top: 2px;
                       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .exp { color: #a5b4cc; font-variant-numeric: tabular-nums; }
+  .exp { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .exp-left { font-weight: 600; }
+  .exp-left.urgent { color: #f87171; }      /* < 5 min */
+  .exp-left.soon   { color: #fb923c; }      /* < 30 min */
+  .exp-left.near   { color: #facc15; }      /* < 2h */
+  .exp-left.far    { color: #a5b4cc; }      /* >= 2h */
+  .exp-window { color: #6a7388; font-size: 11px; margin-left: 4px; }
   .ts { color: #6a7388; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .empty { padding: 30px; text-align: center; color: #6a7388; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
@@ -211,6 +244,25 @@ function edgeClass(e) {
   return 'edge small';
 }
 
+function formatExp(r) {
+  const m = r.exp_min_left;
+  if (m === null || m === undefined) return `<span class="exp-left far">${r.exp}</span>`;
+  let cls = 'far';
+  if (m < 5)       cls = 'urgent';
+  else if (m < 30) cls = 'soon';
+  else if (m < 120) cls = 'near';
+  let txt;
+  if (m < 1)        txt = Math.max(1, Math.round(m * 60)) + ' det';
+  else if (m < 60)  txt = m.toFixed(1) + ' mnt';
+  else {
+    const h = Math.floor(m / 60);
+    const mm = Math.round(m % 60);
+    txt = mm === 0 ? `${h} jam` : `${h}j ${mm}m`;
+  }
+  const win = r.exp_window ? `<span class="exp-window">(${r.exp_window})</span>` : '';
+  return `<span class="exp-left ${cls}">${txt}</span>${win}`;
+}
+
 function tsToDate(ts) {
   // "2026-04-19 13:19:26 WIB" → Date
   const m = ts.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
@@ -239,7 +291,7 @@ function render() {
       <td class="side-${r.side.toLowerCase()}">BUY ${r.side}</td>
       <td class="price">${r.price.toFixed(3)}</td>
       <td class="price">${r.act_size.toFixed(0)}</td>
-      <td class="exp">${r.exp}</td>
+      <td class="exp">${formatExp(r)}</td>
       <td class="price">$${r.btc.toLocaleString()}</td>
       <td class="question" title="${r.question}">
         <div class="q-main">${r.question}</div>
