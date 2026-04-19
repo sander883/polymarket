@@ -141,11 +141,23 @@ def read_log(path: Path, limit: int) -> list[dict]:
     return parsed
 
 
+def _log_mtime(path: Path) -> float | None:
+    """Return file mtime as unix seconds, or None if file missing."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 async def api_signals(request: web.Request) -> web.Response:
     limit = int(request.query.get("limit", "100"))
+    import time as _t
     data = {
         "actionable": read_log(SIGNALS_LOG, limit),
         "near_miss": read_log(NEAR_MISS_LOG, limit),
+        "signals_mtime": _log_mtime(SIGNALS_LOG),
+        "near_miss_mtime": _log_mtime(NEAR_MISS_LOG),
+        "server_now": _t.time(),
     }
     return web.json_response(data)
 
@@ -197,11 +209,19 @@ INDEX_HTML = """<!DOCTYPE html>
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
          background: #4ade80; margin-right: 6px; animation: pulse 1.6s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  .scanner-status { padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
+                    font-size: 13px; border: 1px solid; }
+  .scanner-status.live   { background: #0d2818; border-color: #1f5334; color: #86efac; }
+  .scanner-status.idle   { background: #2a2513; border-color: #5a4a1a; color: #fde68a; }
+  .scanner-status.stale  { background: #2a1313; border-color: #5a1f1f; color: #fca5a5; }
+  .ago { color: #6a7388; font-size: 11px; margin-left: 6px; }
 </style>
 </head>
 <body>
   <h1>Polymarket Latency Arb — Live Dashboard</h1>
   <div class="sub"><span class="dot"></span>auto-refresh 5s · <span id="now"></span></div>
+
+  <div id="scanner-status" class="scanner-status idle">loading…</div>
 
   <div class="stats">
     <div class="stat"><div class="label">Actionable (1h)</div><div class="value" id="act-1h">–</div></div>
@@ -227,7 +247,39 @@ INDEX_HTML = """<!DOCTYPE html>
 
 <script>
 let currentTab = 'act';
-let latest = { actionable: [], near_miss: [] };
+let latest = { actionable: [], near_miss: [], signals_mtime: null, near_miss_mtime: null, server_now: null };
+
+function humanAgo(seconds) {
+  if (seconds < 60) return Math.round(seconds) + ' det lalu';
+  if (seconds < 3600) return Math.round(seconds / 60) + ' mnt lalu';
+  if (seconds < 86400) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.round((seconds % 3600) / 60);
+    return m === 0 ? `${h}j lalu` : `${h}j ${m}m lalu`;
+  }
+  return Math.round(seconds / 86400) + ' hari lalu';
+}
+
+function renderScannerStatus() {
+  const el = document.getElementById('scanner-status');
+  const mt = Math.max(latest.signals_mtime || 0, latest.near_miss_mtime || 0);
+  if (!mt || !latest.server_now) {
+    el.className = 'scanner-status stale';
+    el.textContent = 'Belum ada file log. Scanner belum jalan?';
+    return;
+  }
+  const ageSec = latest.server_now - mt;
+  if (ageSec < 120) {
+    el.className = 'scanner-status live';
+    el.textContent = `● Scanner LIVE — log terakhir diupdate ${humanAgo(ageSec)}`;
+  } else if (ageSec < 1800) {
+    el.className = 'scanner-status idle';
+    el.textContent = `◐ Scanner IDLE — log terakhir diupdate ${humanAgo(ageSec)}. BTC mungkin sedang stabil, tidak ada edge terdeteksi.`;
+  } else {
+    el.className = 'scanner-status stale';
+    el.textContent = `✕ Scanner STALE — log tidak diupdate ${humanAgo(ageSec)}. Kemungkinan scanner mati atau tulis ke path lain.`;
+  }
+}
 
 document.querySelectorAll('.tab').forEach(t => {
   t.onclick = () => {
@@ -263,6 +315,13 @@ function formatExp(r) {
   return `<span class="exp-left ${cls}">${txt}</span>${win}`;
 }
 
+function tsAgo(ts) {
+  const d = tsToDate(ts);
+  if (!d || !latest.server_now) return '';
+  const secs = (latest.server_now * 1000 - d.getTime()) / 1000;
+  return secs >= 0 ? humanAgo(secs) : '';
+}
+
 function tsToDate(ts) {
   // "2026-04-19 13:19:26 WIB" → Date
   const m = ts.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
@@ -286,7 +345,7 @@ function render() {
   }
   tbody.innerHTML = rows.map(r => `
     <tr>
-      <td class="ts">${r.ts}</td>
+      <td class="ts">${r.ts}<div class="ago">${tsAgo(r.ts)}</div></td>
       <td class="${edgeClass(r.edge)}">+${r.edge.toFixed(1)}%</td>
       <td class="side-${r.side.toLowerCase()}">BUY ${r.side}</td>
       <td class="price">${r.price.toFixed(3)}</td>
@@ -319,6 +378,7 @@ async function refresh() {
   try {
     const r = await fetch('/api/signals?limit=200');
     latest = await r.json();
+    renderScannerStatus();
     render();
     updateStats();
     document.getElementById('now').textContent =

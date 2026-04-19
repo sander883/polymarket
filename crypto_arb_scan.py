@@ -31,6 +31,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import ccxt
 
@@ -900,8 +901,9 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
 # ---------------------------------------------------------------------------
 
 
-SIGNAL_LOG = "signals.log"
-NEAR_MISS_LOG = "near_miss.log"
+_LOG_DIR = Path(__file__).resolve().parent
+SIGNAL_LOG = str(_LOG_DIR / "signals.log")
+NEAR_MISS_LOG = str(_LOG_DIR / "near_miss.log")
 
 # WIB = UTC+7
 WIB = timezone(timedelta(hours=7))
