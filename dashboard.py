@@ -18,6 +18,43 @@ ROOT = Path(__file__).parent
 SIGNALS_LOG = ROOT / "signals.log"
 NEAR_MISS_LOG = ROOT / "near_miss.log"
 
+# ET → WIB: +11 jam saat EDT (Mar-Nov), +12 saat EST (Nov-Mar).
+# Default EDT karena mayoritas musim trading BTC jatuh di DST.
+ET_TO_WIB_HOURS = 11
+
+
+def _et_to_wib_str(hour: int, minute: int, ampm: str) -> str:
+    """Konversi jam ET (12h format) ke string WIB (24h)."""
+    h = hour % 12
+    if ampm.upper() == "PM":
+        h += 12
+    total = h * 60 + minute + ET_TO_WIB_HOURS * 60
+    total %= 24 * 60
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+_ET_TIME_RE = re.compile(r"(\d{1,2})(?::(\d{2}))?(AM|PM)", re.IGNORECASE)
+
+
+def question_to_wib(question: str) -> str:
+    """Ubah setiap jam 'hh(:mm)?(AM|PM)' di question jadi 'HH:MM WIB'.
+
+    'April 19, 12:00AM-4:00AM ET' → 'April 19, 11:00-15:00 WIB'
+    'April 19, 2AM ET'            → 'April 19, 13:00 WIB'
+    """
+    if " ET" not in question and " et" not in question:
+        return ""
+
+    def repl(m: re.Match) -> str:
+        h = int(m.group(1))
+        mm = int(m.group(2) or "0")
+        return _et_to_wib_str(h, mm, m.group(3))
+
+    converted = _ET_TIME_RE.sub(repl, question)
+    # Ganti label ET → WIB (case-insensitive, cuma yang berdiri sendiri)
+    converted = re.sub(r"\bET\b", "WIB", converted)
+    return converted
+
 # Contoh baris:
 # [2026-04-19 13:19:26 WIB] ACT EDGE=+26.0% | exp=UD5m 0.6m-left | BTC=$75,350 | buy NO @ 0.640, BTC $75,350 down from open $75,389 | sz_yes=137 sz_no=122 | Bitcoin Up or Down - April 19, 2:15AM-2:20AM ET
 LINE_RE = re.compile(
@@ -54,6 +91,7 @@ def parse_line(line: str) -> dict | None:
         "sz_no": float(d["sz_no"]),
         "act_size": act_size,
         "question": d["question"],
+        "question_wib": question_to_wib(d["question"]),
         "notional_usd": round(act_size * price, 2),
         "potential_profit_usd": round(act_size * (1 - price), 2) if side == "YES" else round(act_size * price * (edge / 100), 2),
     }
@@ -116,7 +154,10 @@ INDEX_HTML = """<!DOCTYPE html>
           padding: 10px 14px; min-width: 120px; }
   .stat .label { font-size: 11px; color: #8a93a6; text-transform: uppercase; letter-spacing: 0.5px; }
   .stat .value { font-size: 20px; font-weight: 600; margin-top: 2px; }
-  .question { color: #cbd3e1; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .question { color: #cbd3e1; max-width: 460px; }
+  .question .q-main { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .question .q-wib  { color: #7dd3fc; font-size: 11.5px; margin-top: 2px;
+                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .exp { color: #a5b4cc; font-variant-numeric: tabular-nums; }
   .ts { color: #6a7388; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .empty { padding: 30px; text-align: center; color: #6a7388; }
@@ -200,7 +241,10 @@ function render() {
       <td class="price">${r.act_size.toFixed(0)}</td>
       <td class="exp">${r.exp}</td>
       <td class="price">$${r.btc.toLocaleString()}</td>
-      <td class="question" title="${r.question}">${r.question}</td>
+      <td class="question" title="${r.question}">
+        <div class="q-main">${r.question}</div>
+        ${r.question_wib ? `<div class="q-wib">→ ${r.question_wib}</div>` : ''}
+      </td>
     </tr>
   `).join('');
 }
