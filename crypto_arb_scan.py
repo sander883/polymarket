@@ -73,9 +73,14 @@ WHICH_FIRST_PATTERN = re.compile(
 # Minimum plausible BTC strike price — anything below this is not a price market
 MIN_BTC_STRIKE = 10_000
 
-# Minimum ask-side size on the actionable leg. Below this the signal is real
-# but too thin to execute profitably (fees + slippage eat the edge).
-MIN_SIGNAL_SIZE = 200
+# Signals are tiered into two logs:
+#   signals.log   — "actionable": edge >= ACTIONABLE_EDGE_PCT AND size >= ACTIONABLE_SIZE
+#   near_miss.log — everything else with a positive edge (diagnostic data)
+# Hard floor below: signals with size < MIN_SIGNAL_SIZE are dropped entirely
+# (they're almost certainly already-filled tails, not real edges).
+MIN_SIGNAL_SIZE = 10
+ACTIONABLE_EDGE_PCT = 3.0
+ACTIONABLE_SIZE = 30
 
 # ---------------------------------------------------------------------------
 # Expiry / time-to-resolution parsing
@@ -894,6 +899,7 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
 
 
 SIGNAL_LOG = "signals.log"
+NEAR_MISS_LOG = "near_miss.log"
 
 # WIB = UTC+7
 WIB = timezone(timedelta(hours=7))
@@ -904,8 +910,20 @@ def _wib_now() -> str:
     return datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
 
 
+def _actionable_size(signal: ArbSignal) -> float:
+    """Size available on the leg the signal says to buy."""
+    cm = signal.crypto_market
+    # edge_description always starts with "buy YES" or "buy NO"
+    return cm.yes_ask_size if signal.edge_description.startswith("buy YES") else cm.no_ask_size
+
+
 def log_signal(signal: ArbSignal) -> None:
-    """Append a signal to signals.log for easy 24/7 review."""
+    """Append a signal to the appropriate log.
+
+    Actionable (edge >= ACTIONABLE_EDGE_PCT AND size >= ACTIONABLE_SIZE)
+    lands in signals.log. Everything else goes to near_miss.log for
+    diagnostic review — these are real edges but too thin/small to trade.
+    """
     ts = _wib_now()
     cm = signal.crypto_market
     if cm.direction == "up_or_down":
@@ -918,8 +936,16 @@ def log_signal(signal: ArbSignal) -> None:
     else:
         hte = cm.hours_to_expiry
         exp_str = f"{hte:.1f}h" if hte is not None else "??"
+
+    act_size = _actionable_size(signal)
+    is_actionable = (
+        signal.edge_pct >= ACTIONABLE_EDGE_PCT and act_size >= ACTIONABLE_SIZE
+    )
+    tag = "ACT" if is_actionable else "NM "
+    target = SIGNAL_LOG if is_actionable else NEAR_MISS_LOG
+
     line = (
-        f"[{ts}] EDGE={signal.edge_pct:+.1f}% | "
+        f"[{ts}] {tag} EDGE={signal.edge_pct:+.1f}% | "
         f"exp={exp_str} | "
         f"BTC=${signal.binance_price:,.0f} | "
         f"{signal.edge_description} | "
@@ -927,7 +953,7 @@ def log_signal(signal: ArbSignal) -> None:
         f"{cm.market.question[:60]}\n"
     )
     try:
-        with open(SIGNAL_LOG, "a") as f:
+        with open(target, "a") as f:
             f.write(line)
     except OSError:
         pass  # don't crash the scanner if file write fails
