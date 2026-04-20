@@ -1060,6 +1060,32 @@ async def run_once(verbose: bool) -> int:
         return 1
 
 
+SCAN_OUTPUT_LOG = str(_LOG_DIR / "scan_output.log")
+
+
+class _Tee:
+    """Duplicate stdout to both terminal and a log file."""
+
+    def __init__(self, path: str) -> None:
+        self._terminal = sys.stdout
+        self._file = open(path, "a", buffering=1, encoding="utf-8")  # line-buffered
+
+    def write(self, data: str) -> int:
+        self._terminal.write(data)
+        try:
+            self._file.write(data)
+        except OSError:
+            pass
+        return len(data)
+
+    def flush(self) -> None:
+        self._terminal.flush()
+        try:
+            self._file.flush()
+        except OSError:
+            pass
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -1070,6 +1096,8 @@ def main() -> int:
     p.add_argument("-v", "--verbose", action="store_true",
                    help="show all markets, not just mispricings")
     args = p.parse_args()
+
+    sys.stdout = _Tee(SCAN_OUTPUT_LOG)
 
     # suppress noisy library loggers
     logging.basicConfig(
