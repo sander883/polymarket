@@ -567,9 +567,13 @@ async def fetch_crypto_markets(
 
     # Parse strike prices (BTC only for now)
     crypto: list[tuple[Market, float, str]] = []
+    skipped_dead = 0
     for m in markets:
         q = m.question.lower()
         if "btc" not in q and "bitcoin" not in q:
+            continue
+        if m.volume == 0 and m.liquidity == 0:
+            skipped_dead += 1
             continue
         parsed = parse_strike(m.question)
         if parsed:
@@ -580,7 +584,13 @@ async def fetch_crypto_markets(
     seen_ids = {c[0].market_id for c in crypto}
     for m in markets:
         if up_down_pattern.search(m.question) and m.market_id not in seen_ids:
+            if m.volume == 0 and m.liquidity == 0:
+                skipped_dead += 1
+                continue
             crypto.append((m, 0.0, "up_or_down"))
+
+    if verbose and skipped_dead:
+        print(f"  Skipped {skipped_dead} dead markets (vol=0, liq=0)")
 
     return crypto
 
