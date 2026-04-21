@@ -40,7 +40,7 @@ WIB = timezone(timedelta(hours=7))
 
 MAX_WINDOW_MINUTES = 5           # hanya 5-min Up/Down markets
 MAX_MINUTES_LEFT = 2.0           # window hampir tutup
-MIN_EDGE_PCT = 8.0               # threshold tinggi (aman)
+MIN_EDGE_PCT = 15.0              # data-driven: 8-15% bucket = 50% winrate, skip
 MIN_ACT_SIZE = 50                # minimal share tersedia
 MIN_PRICE = 0.50                 # jangan beli yg terlalu murah (too risky)
 MAX_PRICE = 0.92                 # jangan beli yg terlalu mahal (low reward)
