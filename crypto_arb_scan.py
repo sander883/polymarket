@@ -963,6 +963,9 @@ def log_signal(signal: ArbSignal) -> None:
     target = SIGNAL_LOG if is_actionable else NEAR_MISS_LOG
 
     slug = getattr(cm.market, "slug", "") or ""
+    yes_tid = getattr(cm.market, "yes_token_id", "") or ""
+    no_tid = getattr(cm.market, "no_token_id", "") or ""
+    cond_id = getattr(cm.market, "condition_id", "") or ""
     line = (
         f"[{ts}] {tag} EDGE={signal.edge_pct:+.1f}% | "
         f"exp={exp_str} | "
@@ -970,7 +973,8 @@ def log_signal(signal: ArbSignal) -> None:
         f"{signal.edge_description} | "
         f"sz_yes={cm.yes_ask_size:.0f} sz_no={cm.no_ask_size:.0f} | "
         f"{cm.market.question[:60]} | "
-        f"slug={slug}\n"
+        f"slug={slug} | "
+        f"yes_tid={yes_tid} | no_tid={no_tid} | cond={cond_id}\n"
     )
     try:
         with open(target, "a") as f:

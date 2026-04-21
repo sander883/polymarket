@@ -67,7 +67,12 @@ SIGNAL_RE = re.compile(
     r"BTC=\$(?P<btc>[\d,]+)\s*\|\s*"
     r"buy\s+(?P<side>YES|NO)\s+@\s+(?P<price>[\d.]+)[^|]*\|\s*"
     r"sz_yes=(?P<sz_yes>[\d.]+)\s+sz_no=(?P<sz_no>[\d.]+)\s*\|\s*"
-    r"(?P<question>[^|]+?)(?:\s*\|\s*slug=(?P<slug>\S*))?\s*$"
+    r"(?P<question>[^|]+?)"
+    r"(?:\s*\|\s*slug=(?P<slug>\S*))?"
+    r"(?:\s*\|\s*yes_tid=(?P<yes_tid>\S*))?"
+    r"(?:\s*\|\s*no_tid=(?P<no_tid>\S*))?"
+    r"(?:\s*\|\s*cond=(?P<cond>\S*))?"
+    r"\s*$"
 )
 
 EXP_UD_RE = re.compile(r"UD(\d+)m\s+([\d.]+)m-left")
@@ -88,6 +93,9 @@ class ParsedSignal:
     act_size: float
     question: str
     slug: str
+    yes_token_id: str
+    no_token_id: str
+    condition_id: str
 
 
 def parse_signal_line(line: str) -> ParsedSignal | None:
@@ -119,6 +127,9 @@ def parse_signal_line(line: str) -> ParsedSignal | None:
         act_size=act_size,
         question=d["question"].strip(),
         slug=(d.get("slug") or "").strip(),
+        yes_token_id=(d.get("yes_tid") or "").strip(),
+        no_token_id=(d.get("no_tid") or "").strip(),
+        condition_id=(d.get("cond") or "").strip(),
     )
 
 
@@ -462,23 +473,128 @@ def generate_report() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Live execution via py-clob-client
+# ---------------------------------------------------------------------------
+
+LIVE_TRADES_LOG = ROOT / "live_trades.log"
+
+CLOB_HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137  # Polygon mainnet
+
+
+def _load_clob_client():
+    """Initialize ClobClient with credentials from .env."""
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+
+    private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+    if not private_key or private_key == "0xyour_private_key_here":
+        raise RuntimeError(
+            "POLYMARKET_PRIVATE_KEY not set in .env\n"
+            "  1. Buat wallet baru di Polymarket\n"
+            "  2. Export private key\n"
+            "  3. Isi di .env: POLYMARKET_PRIVATE_KEY=0x..."
+        )
+
+    from py_clob_client.client import ClobClient
+    client = ClobClient(
+        host=CLOB_HOST,
+        chain_id=CHAIN_ID,
+        key=private_key,
+        signature_type=2,  # POLY_GNOSIS_SAFE for Polymarket proxy wallets
+    )
+
+    # Derive or load API credentials
+    creds = client.create_or_derive_api_creds()
+    client.set_api_creds(creds)
+
+    return client
+
+
+def place_live_order(client, sig: ParsedSignal, shares: float) -> dict:
+    """Place a real order on Polymarket. Returns order response dict."""
+    from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+
+    token_id = sig.yes_token_id if sig.side == "YES" else sig.no_token_id
+    if not token_id:
+        raise ValueError(f"No token_id for {sig.side} side — signal from old log format?")
+
+    order_args = OrderArgs(
+        token_id=token_id,
+        price=sig.price,
+        size=round(shares, 2),
+        side="BUY",
+    )
+
+    options = PartialCreateOrderOptions(order_type=OrderType.FOK)
+
+    resp = client.create_and_post_order(order_args, options)
+    return resp
+
+
+def log_live_trade(sig: ParsedSignal, shares: float, cost: float,
+                   resp: dict, status: str) -> None:
+    """Log live trade to live_trades.log."""
+    ts = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+    order_id = ""
+    if isinstance(resp, dict):
+        order_id = resp.get("orderID", resp.get("id", ""))
+    line = (
+        f"[{ts}] LIVE {status} {sig.side} @ {sig.price:.3f} "
+        f"x {shares:.0f} = ${cost:.2f} | "
+        f"edge={sig.edge_pct:+.1f}% | "
+        f"left={sig.minutes_left:.1f}m | "
+        f"order={order_id} | "
+        f"{sig.question[:50]}\n"
+    )
+    try:
+        with open(LIVE_TRADES_LOG, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Main loop — tail signals.log
 # ---------------------------------------------------------------------------
 
-def run_watcher(interval: float) -> None:
+def run_watcher(interval: float, live: bool = False) -> None:
     """Poll signals.log and evaluate new signals."""
     executor = DryRunExecutor()
     ts = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
+    mode = "LIVE" if live else "DRY RUN"
 
-    print(f"Auto-executor DRY RUN started at {ts}")
+    clob_client = None
+    if live:
+        clob_client = _load_clob_client()
+        addr = clob_client.get_address()
+        print(f"Auto-executor {mode} started at {ts}")
+        print(f"Wallet: {addr}")
+
+        # Check balance
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        bal = clob_client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        balance = float(bal.get("balance", 0)) / 1e6  # USDC has 6 decimals
+        print(f"USDC Balance: ${balance:.2f}")
+        if balance < MAX_PER_TRADE_USD:
+            print(f"WARNING: Balance ${balance:.2f} < MAX_PER_TRADE_USD ${MAX_PER_TRADE_USD}")
+            print(f"Deposit more USDC ke wallet Polygon sebelum trading.")
+    else:
+        print(f"Auto-executor {mode} started at {ts}")
+
     print(f"Watching: {SIGNAL_LOG}")
-    print(f"Logging:  {TRADES_LOG}")
+    print(f"Logging:  {TRADES_LOG}" + (f" + {LIVE_TRADES_LOG}" if live else ""))
     print(f"Criteria: {MAX_WINDOW_MINUTES}m window, <{MAX_MINUTES_LEFT}m left, "
           f"edge>{MIN_EDGE_PCT}%, size>{MIN_ACT_SIZE}, "
           f"price {MIN_PRICE}-{MAX_PRICE}")
     print(f"Risk:     ${MAX_PER_TRADE_USD}/trade, ${MAX_TOTAL_EXPOSURE_USD} max, "
           f"kill@-${DAILY_LOSS_KILL_USD}/day")
     print(f"Press Ctrl-C to stop.\n")
+
+    live_trades_count = 0
+    live_total_cost = 0.0
 
     try:
         while True:
@@ -495,8 +611,26 @@ def run_watcher(interval: float) -> None:
                           f"exp_profit=${d.expected_profit_usd:.2f} | "
                           f"{sig.question[:40]}")
 
-                    # Schedule position release after window closes
-                    # (In dry-run we release immediately since we can't track real resolution)
+                    if live and clob_client:
+                        try:
+                            resp = place_live_order(
+                                clob_client, sig, d.trade_size_shares
+                            )
+                            status = "FILLED" if resp.get("success") else "FAILED"
+                            log_live_trade(
+                                sig, d.trade_size_shares, d.trade_cost_usd,
+                                resp, status,
+                            )
+                            live_trades_count += 1
+                            live_total_cost += d.trade_cost_usd
+                            print(f"      LIVE {status}: {resp}")
+                        except Exception as exc:
+                            log_live_trade(
+                                sig, d.trade_size_shares, d.trade_cost_usd,
+                                {}, f"ERROR: {exc}",
+                            )
+                            print(f"      LIVE ERROR: {exc}")
+
                     executor.release_position(d.trade_cost_usd)
                 else:
                     print(f"  --- SKIP  {d.reject_reason} | "
@@ -506,7 +640,11 @@ def run_watcher(interval: float) -> None:
             time.sleep(interval)
 
     except KeyboardInterrupt:
-        print(f"\nStopped. Run 'python auto_executor.py --report' for analysis.")
+        print(f"\nStopped.")
+        if live:
+            print(f"Live trades: {live_trades_count}, total cost: ${live_total_cost:.2f}")
+            print(f"Review: cat {LIVE_TRADES_LOG}")
+        print(f"Run 'python auto_executor.py --report' for analysis.")
 
 
 # ---------------------------------------------------------------------------
@@ -520,13 +658,28 @@ def main() -> int:
                    help="poll interval in seconds (default 5)")
     p.add_argument("--report", action="store_true",
                    help="analyze dry_run_trades.log and print summary")
+    p.add_argument("--live", action="store_true",
+                   help="LIVE MODE: place real orders (requires .env + USDC)")
     args = p.parse_args()
 
     if args.report:
         generate_report()
         return 0
 
-    run_watcher(args.interval)
+    if args.live:
+        print("=" * 60)
+        print("  WARNING: LIVE TRADING MODE")
+        print(f"  Max per trade: ${MAX_PER_TRADE_USD}")
+        print(f"  Max exposure:  ${MAX_TOTAL_EXPOSURE_USD}")
+        print(f"  Daily kill:    -${DAILY_LOSS_KILL_USD}")
+        print("=" * 60)
+        confirm = input("  Type 'YES' to confirm: ").strip()
+        if confirm != "YES":
+            print("  Cancelled.")
+            return 0
+        print()
+
+    run_watcher(args.interval, live=args.live)
     return 0
 
 
