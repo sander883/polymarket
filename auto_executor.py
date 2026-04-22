@@ -44,6 +44,7 @@ MIN_EDGE_PCT = 15.0              # data-driven: 8-15% bucket = 50% winrate, skip
 MIN_ACT_SIZE = 50                # minimal share tersedia
 MIN_PRICE = 0.50                 # jangan beli yg terlalu murah (too risky)
 MAX_PRICE = 0.92                 # jangan beli yg terlalu mahal (low reward)
+MAX_SLIPPAGE_PCT = 5.0           # abort if live price moved >5% from signal price
 
 # Risk caps
 MAX_PER_TRADE_USD = 5.0          # $5 per trade (micro-start)
@@ -520,6 +521,19 @@ def _load_clob_client():
     return client
 
 
+def _check_live_price(client, sig: ParsedSignal) -> tuple[float, float] | None:
+    """Re-fetch orderbook and return (live_price, live_size) or None if stale."""
+    token_id = sig.yes_token_id if sig.side == "YES" else sig.no_token_id
+    try:
+        book = client.get_order_book(token_id)
+        if not book or not book.asks:
+            return None
+        best = book.asks[0]
+        return float(best.price), float(best.size)
+    except Exception:
+        return None
+
+
 def place_live_order(client, sig: ParsedSignal, shares: float, cost: float) -> dict:
     """Place a real order on Polymarket. Returns order response dict."""
     from py_clob_client.clob_types import MarketOrderArgs, OrderType
@@ -528,6 +542,16 @@ def place_live_order(client, sig: ParsedSignal, shares: float, cost: float) -> d
     if not token_id:
         raise ValueError(f"No token_id for {sig.side} side — signal from old log format?")
 
+    live = _check_live_price(client, sig)
+    if live is not None:
+        live_price, live_size = live
+        slippage = (live_price - sig.price) / sig.price * 100
+        if slippage > MAX_SLIPPAGE_PCT:
+            raise ValueError(
+                f"slippage {slippage:+.1f}%: signal={sig.price:.3f} live={live_price:.3f}"
+            )
+        cost = round(min(cost, live_size * live_price, MAX_PER_TRADE_USD), 2)
+
     order_args = MarketOrderArgs(
         token_id=token_id,
         amount=round(cost, 2),
@@ -535,7 +559,10 @@ def place_live_order(client, sig: ParsedSignal, shares: float, cost: float) -> d
         order_type=OrderType.FOK,
     )
 
-    resp = client.create_market_order(order_args)
+    signed_order = client.create_market_order(order_args)
+    resp = client.post_order(signed_order, orderType=OrderType.FOK)
+    if not isinstance(resp, dict):
+        resp = {"raw": str(resp)}
     return resp
 
 
