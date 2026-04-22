@@ -35,11 +35,11 @@ POSITIONS_FILE = ROOT / "dry_run_positions.json"
 WIB = timezone(timedelta(hours=7))
 
 # ---------------------------------------------------------------------------
-# Execution criteria — only 5-min sub-expiry for now
+# Execution criteria — Up/Down markets ≤60min, trade only in last minute
 # ---------------------------------------------------------------------------
 
-MAX_WINDOW_MINUTES = 5           # hanya 5-min Up/Down markets
-MAX_MINUTES_LEFT = 2.0           # window hampir tutup
+MAX_WINDOW_MINUTES = 60          # 5m, 15m, 60m Up/Down markets
+MAX_MINUTES_LEFT = 1.0           # only trade when <1min left (near-certain outcome)
 MIN_EDGE_PCT = 15.0              # data-driven: 8-15% bucket = 50% winrate, skip
 MIN_ACT_SIZE = 50                # minimal share tersedia
 MIN_PRICE = 0.50                 # jangan beli yg terlalu murah (too risky)
