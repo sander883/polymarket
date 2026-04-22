@@ -199,6 +199,9 @@ class DryRunExecutor:
         if sig.window_minutes is None:
             return "not-up-down-market"
 
+        if not sig.yes_token_id or not sig.no_token_id:
+            return "missing-token-id (old log format)"
+
         if sig.window_minutes > MAX_WINDOW_MINUTES:
             return f"window-too-long ({sig.window_minutes}m > {MAX_WINDOW_MINUTES}m)"
 
@@ -511,24 +514,22 @@ def _load_clob_client():
     return client
 
 
-def place_live_order(client, sig: ParsedSignal, shares: float) -> dict:
+def place_live_order(client, sig: ParsedSignal, shares: float, cost: float) -> dict:
     """Place a real order on Polymarket. Returns order response dict."""
-    from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
 
     token_id = sig.yes_token_id if sig.side == "YES" else sig.no_token_id
     if not token_id:
         raise ValueError(f"No token_id for {sig.side} side — signal from old log format?")
 
-    order_args = OrderArgs(
+    order_args = MarketOrderArgs(
         token_id=token_id,
-        price=sig.price,
-        size=round(shares, 2),
+        amount=round(cost, 2),
         side="BUY",
+        order_type=OrderType.FOK,
     )
 
-    options = PartialCreateOrderOptions(order_type=OrderType.FOK)
-
-    resp = client.create_and_post_order(order_args, options)
+    resp = client.create_market_order(order_args)
     return resp
 
 
@@ -614,7 +615,8 @@ def run_watcher(interval: float, live: bool = False) -> None:
                     if live and clob_client:
                         try:
                             resp = place_live_order(
-                                clob_client, sig, d.trade_size_shares
+                                clob_client, sig, d.trade_size_shares,
+                                d.trade_cost_usd,
                             )
                             status = "FILLED" if resp.get("success") else "FAILED"
                             log_live_trade(
