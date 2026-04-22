@@ -42,8 +42,8 @@ MAX_WINDOW_MINUTES = 60          # 5m, 15m, 60m Up/Down markets
 MAX_MINUTES_LEFT = 1.0           # only trade when <1min left (near-certain outcome)
 MIN_EDGE_PCT = 15.0              # data-driven: 8-15% bucket = 50% winrate, skip
 MIN_ACT_SIZE = 50                # minimal share tersedia
-MIN_PRICE = 0.50                 # jangan beli yg terlalu murah (too risky)
-MAX_PRICE = 0.92                 # jangan beli yg terlalu mahal (low reward)
+MIN_PRICE = 0.20                 # stale orders di bawah ini kemungkinan phantom
+MAX_PRICE = 0.95                 # sangat mahal = edge terlalu tipis
 MAX_SLIPPAGE_PCT = 5.0           # abort if live price moved >5% from signal price
 
 # Risk caps
