@@ -165,14 +165,20 @@ class DayStats:
 class DryRunExecutor:
     """Simulates trade decisions without placing real orders."""
 
-    def __init__(self) -> None:
-        self._seen_lines: int = 0   # track last read position in signals.log
+    def __init__(self, skip_existing: bool = False) -> None:
+        self._seen_lines: int = 0
         self._recent_trades: list[tuple[str, float]] = []  # (question, timestamp)
         self._today: str = ""
         self._day_stats = DayStats()
         self._open_positions: int = 0
         self._total_exposure: float = 0.0
         self._all_decisions: list[TradeDecision] = []
+
+        if skip_existing and SIGNAL_LOG.exists():
+            try:
+                self._seen_lines = len(SIGNAL_LOG.read_text().splitlines())
+            except OSError:
+                pass
 
     def _reset_day_if_needed(self) -> None:
         today = datetime.now(WIB).strftime("%Y-%m-%d")
@@ -561,7 +567,7 @@ def log_live_trade(sig: ParsedSignal, shares: float, cost: float,
 
 def run_watcher(interval: float, live: bool = False) -> None:
     """Poll signals.log and evaluate new signals."""
-    executor = DryRunExecutor()
+    executor = DryRunExecutor(skip_existing=live)
     ts = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB")
     mode = "LIVE" if live else "DRY RUN"
 
