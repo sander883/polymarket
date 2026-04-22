@@ -683,6 +683,138 @@ def run_watcher(interval: float, live: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# LiveExecutor — called directly from scanner, no file round-trip
+# ---------------------------------------------------------------------------
+
+
+class LiveExecutor:
+    """Immediate execution from scanner signals. No file latency."""
+
+    def __init__(self) -> None:
+        self._client = _load_clob_client()
+        addr = self._client.get_address()
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        bal = self._client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        balance = float(bal.get("balance", 0)) / 1e6
+        print(f"LIVE executor ready — wallet {addr}, ${balance:.2f} USDC")
+        print(f"Criteria: {MAX_WINDOW_MINUTES}m window, <{MAX_MINUTES_LEFT}m left, "
+              f"edge>{MIN_EDGE_PCT}%, size>{MIN_ACT_SIZE}, "
+              f"price {MIN_PRICE}-{MAX_PRICE}")
+        print(f"Risk: ${MAX_PER_TRADE_USD}/trade, ${MAX_TOTAL_EXPOSURE_USD} max, "
+              f"slippage<{MAX_SLIPPAGE_PCT}%\n")
+
+        self._recent: list[tuple[str, float]] = []
+        self._trades: int = 0
+        self._total_cost: float = 0.0
+        self._exposure: float = 0.0
+
+    def _is_dup(self, question: str) -> bool:
+        now = time.time()
+        self._recent = [(q, t) for q, t in self._recent
+                        if now - t < DEDUP_WINDOW_SEC]
+        return any(q == question for q, _ in self._recent)
+
+    def try_execute(self, signal) -> None:
+        """Evaluate an ArbSignal and execute if criteria met."""
+        from crypto_arb_scan import parse_up_down
+        cm = signal.crypto_market
+        question = cm.market.question
+
+        # Build a minimal ParsedSignal for the order functions
+        side = "YES" if signal.edge_description.startswith("buy YES") else "NO"
+        price = cm.yes_ask if side == "YES" else cm.no_ask
+        act_size = cm.yes_ask_size if side == "YES" else cm.no_ask_size
+
+        # Parse Up/Down window timing
+        ud = parse_up_down(question)
+        if ud is not None:
+            window_minutes = ud.window_minutes
+            minutes_left = ud.window_minutes - ud.minutes_elapsed
+        else:
+            window_minutes = None
+            minutes_left = None
+
+        # --- Criteria checks ---
+        tag = "LIVE"
+        reject = None
+
+        if window_minutes is None:
+            reject = "not-up-down"
+        elif window_minutes > MAX_WINDOW_MINUTES:
+            reject = f"window-{window_minutes}m>{MAX_WINDOW_MINUTES}m"
+        elif minutes_left is None or minutes_left > MAX_MINUTES_LEFT:
+            reject = f"time-left-{minutes_left:.1f}m>{MAX_MINUTES_LEFT}m"
+        elif signal.edge_pct < MIN_EDGE_PCT:
+            reject = f"edge-{signal.edge_pct:.1f}%<{MIN_EDGE_PCT}%"
+        elif act_size < MIN_ACT_SIZE:
+            reject = f"size-{act_size:.0f}<{MIN_ACT_SIZE}"
+        elif price < MIN_PRICE:
+            reject = f"price-{price:.3f}<{MIN_PRICE}"
+        elif price > MAX_PRICE:
+            reject = f"price-{price:.3f}>{MAX_PRICE}"
+        elif self._is_dup(question):
+            reject = "duplicate"
+        elif self._exposure >= MAX_TOTAL_EXPOSURE_USD:
+            reject = f"exposure-${self._exposure:.0f}>=${MAX_TOTAL_EXPOSURE_USD}"
+
+        if reject:
+            print(f"      [{tag}] SKIP {reject} | "
+                  f"edge={signal.edge_pct:+.1f}% {side}@{price:.3f} | "
+                  f"{question[:40]}")
+            return
+
+        # Calculate trade size
+        shares = min(MAX_PER_TRADE_USD / price, act_size)
+        cost = round(shares * price, 2)
+        cost = min(cost, MAX_PER_TRADE_USD)
+
+        yes_tid = getattr(cm.market, "yes_token_id", "") or ""
+        no_tid = getattr(cm.market, "no_token_id", "") or ""
+        cond_id = getattr(cm.market, "condition_id", "") or ""
+
+        if not yes_tid or not no_tid:
+            print(f"      [{tag}] SKIP missing-token-id | {question[:40]}")
+            return
+
+        sig = ParsedSignal(
+            ts=datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S WIB"),
+            tag="ACT", edge_pct=signal.edge_pct,
+            window_minutes=window_minutes, minutes_left=minutes_left,
+            btc_price=int(signal.binance_price),
+            side=side, price=price,
+            sz_yes=cm.yes_ask_size, sz_no=cm.no_ask_size,
+            act_size=act_size, question=question,
+            slug=getattr(cm.market, "slug", "") or "",
+            yes_token_id=yes_tid, no_token_id=no_tid,
+            condition_id=cond_id,
+        )
+
+        print(f"      [{tag}] >>> {side} @ {price:.3f} "
+              f"x {shares:.0f} = ${cost:.2f} | "
+              f"edge={signal.edge_pct:+.1f}% left={minutes_left:.1f}m")
+
+        try:
+            resp = place_live_order(self._client, sig, shares, cost)
+            status = "FILLED" if resp.get("success") else "FAILED"
+            log_live_trade(sig, shares, cost, resp, status)
+            self._trades += 1
+            self._total_cost += cost
+            self._exposure += cost
+            self._recent.append((question, time.time()))
+            print(f"      [{tag}] {status}: {resp}")
+        except Exception as exc:
+            log_live_trade(sig, shares, cost, {}, f"ERROR: {exc}")
+            print(f"      [{tag}] ERROR: {exc}")
+
+    def print_summary(self) -> None:
+        print(f"\nLive trades: {self._trades}, total cost: ${self._total_cost:.2f}")
+        if self._trades:
+            print(f"Review: cat {LIVE_TRADES_LOG}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

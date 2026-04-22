@@ -983,8 +983,9 @@ def log_signal(signal: ArbSignal) -> None:
         pass  # don't crash the scanner if file write fails
 
 
-def print_report(signals: list[ArbSignal], btc_price: float) -> None:
-    """Print scan results."""
+def print_report(signals: list[ArbSignal], btc_price: float,
+                 live_executor=None) -> None:
+    """Print scan results. If live_executor is set, execute trades immediately."""
     ts = _wib_now()
     print(f"\n{'=' * 70}")
     print(f"CRYPTO ARB SCAN — BTC=${btc_price:,.2f} — {ts}")
@@ -1010,8 +1011,10 @@ def print_report(signals: list[ArbSignal], btc_price: float) -> None:
         print(f"  Action:  {s.edge_description}")
         print()
 
-        # Auto-log every signal to file
         log_signal(s)
+
+        if live_executor is not None:
+            live_executor.try_execute(s)
 
 
 # ---------------------------------------------------------------------------
@@ -1019,10 +1022,12 @@ def print_report(signals: list[ArbSignal], btc_price: float) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def run_loop(interval: float, verbose: bool) -> None:
+async def run_loop(interval: float, verbose: bool,
+                   live_executor=None) -> None:
     """Continuous scanning loop."""
     ts = _wib_now()
-    print(f"Starting crypto arb scanner (interval={interval}s)")
+    mode = "LIVE" if live_executor else "SCAN"
+    print(f"Starting crypto arb scanner [{mode}] (interval={interval}s)")
     print(f"Time: {ts}")
     print(f"Signals auto-logged to: {SIGNAL_LOG}")
     print(f"Press Ctrl-C to stop.\n")
@@ -1042,7 +1047,8 @@ async def run_loop(interval: float, verbose: bool) -> None:
                 if signals:
                     total_signals += len(signals)
                     btc_price = signals[0].binance_price
-                    print_report(signals, btc_price)
+                    print_report(signals, btc_price,
+                                 live_executor=live_executor)
                 else:
                     if verbose:
                         print(f"  No edge detected.\n")
@@ -1058,6 +1064,8 @@ async def run_loop(interval: float, verbose: bool) -> None:
         print(f"\n\nStopped at {_wib_now()}. {cycle} cycles, {total_signals} total signals.")
         if total_signals > 0:
             print(f"Review signals: cat {SIGNAL_LOG}")
+        if live_executor:
+            live_executor.print_summary()
 
 
 async def run_once(verbose: bool) -> int:
@@ -1109,6 +1117,8 @@ def main() -> int:
                    help="continuous mode: seconds between scans (0=one-shot)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="show all markets, not just mispricings")
+    p.add_argument("--live", action="store_true",
+                   help="LIVE: execute trades immediately when signal detected")
     args = p.parse_args()
 
     sys.stdout = _Tee(SCAN_OUTPUT_LOG)
@@ -1124,8 +1134,16 @@ def main() -> int:
     for noisy in ("ccxt", "httpx", "httpcore", "urllib3", "hpack"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    live_exec = None
+    if args.live:
+        from auto_executor import LiveExecutor
+        live_exec = LiveExecutor()
+        if args.loop <= 0:
+            args.loop = 5  # live mode needs a loop
+
     if args.loop > 0:
-        return asyncio.run(run_loop(args.loop, args.verbose))
+        return asyncio.run(run_loop(args.loop, args.verbose,
+                                    live_executor=live_exec))
     else:
         return asyncio.run(run_once(args.verbose))
 
