@@ -49,7 +49,7 @@ TRADE_RE = re.compile(
 )
 LIVE_STATUS_RE = re.compile(r"\[LIVE\]\s+(FILLED|FAILED|ERROR)")
 LIVE_SKIP_RE = re.compile(r"\[LIVE\]\s+SKIP\s+(\S+)")
-BTC_RE = re.compile(r"Binance BTC/USDT:\s+\$([\d,.]+)")
+BTC_RE = re.compile(r"BTC=\$([\d,.]+)")
 CYCLE_RE = re.compile(r"Cycle\s+(\d+)")
 EDGE_RE = re.compile(r"edge=([+-][\d.]+)%")
 SLIPPAGE_RE = re.compile(r"slippage\s+([+-][\d.]+)%")

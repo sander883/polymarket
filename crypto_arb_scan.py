@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # "Will Bitcoin reach $150,000 in April?"
 # "Bitcoin above $84k?"
 STRIKE_PATTERN = re.compile(
-    r"(?:BTC|Bitcoin).*?(?:above|below|over|under|reach|hit|exceed)\s*\$?([\d,]+(?:\.\d+)?(?:k|K)?)",
+    r"(?:BTC|Bitcoin|ETH|Ethereum|SOL|Solana).*?(?:above|below|over|under|reach|hit|exceed)\s*\$?([\d,]+(?:\.\d+)?(?:k|K)?)",
     re.IGNORECASE,
 )
 
@@ -71,8 +71,9 @@ WHICH_FIRST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Minimum plausible BTC strike price — anything below this is not a price market
-MIN_BTC_STRIKE = 10_000
+# Minimum plausible strike price — filters out non-price markets
+# SOL ~$20-300, ETH ~$500-10000, BTC ~$10000+
+MIN_STRIKE = 15
 
 # Signals are tiered into two logs:
 #   signals.log   — "actionable": big edge regardless of size, OR decent edge with size
@@ -259,6 +260,16 @@ def hours_to_expiry(question: str) -> float | None:
 # ---------------------------------------------------------------------------
 
 
+def detect_coin(question: str) -> str:
+    """Detect which coin a market question is about."""
+    q = question.lower()
+    if "eth" in q or "ethereum" in q:
+        return "ETH"
+    if "sol" in q or "solana" in q:
+        return "SOL"
+    return "BTC"
+
+
 @dataclass
 class CryptoMarket:
     """A Polymarket crypto price market with parsed metadata."""
@@ -266,6 +277,7 @@ class CryptoMarket:
     market: Market
     strike_price: float
     direction: str  # "above" or "below"
+    coin: str       # "BTC", "ETH", "SOL"
     yes_ask: float  # current YES ask price on Polymarket
     no_ask: float   # current NO ask price on Polymarket
     yes_bid: float
@@ -289,27 +301,37 @@ class ArbSignal:
 
 
 # ---------------------------------------------------------------------------
-# Binance price feed
+# Binance price feed — multi-coin
 # ---------------------------------------------------------------------------
 
+COINS = {
+    "BTC": "BTC/USDT",
+    "ETH": "ETH/USDT",
+    "SOL": "SOL/USDT",
+}
 
 _binance = ccxt.binance({"enableRateLimit": True})
 
 
-def get_binance_btc_price() -> float:
-    """Fetch current BTC/USDT price from Binance via ccxt (REST)."""
-    ticker = _binance.fetch_ticker("BTC/USDT")
-    return float(ticker["last"])
+def get_binance_prices() -> dict[str, float]:
+    """Fetch current prices for all tracked coins from Binance."""
+    prices: dict[str, float] = {}
+    for coin, symbol in COINS.items():
+        try:
+            ticker = _binance.fetch_ticker(symbol)
+            prices[coin] = float(ticker["last"])
+        except Exception as exc:
+            logger.warning("failed to fetch %s: %s", symbol, exc)
+    return prices
 
 
-def get_binance_btc_price_at(ts_ms: int) -> float | None:
-    """Fetch the BTC/USDT price at a specific timestamp using 1-min klines.
-
-    Returns the open price of the 1-min candle that contains the timestamp.
-    This is the reference price for Up/Down market resolution.
-    """
+def get_binance_price_at(coin: str, ts_ms: int) -> float | None:
+    """Fetch price at a specific timestamp using 1-min klines."""
+    symbol = COINS.get(coin)
+    if not symbol:
+        return None
     try:
-        ohlcv = _binance.fetch_ohlcv("BTC/USDT", "1m", since=ts_ms, limit=1)
+        ohlcv = _binance.fetch_ohlcv(symbol, "1m", since=ts_ms, limit=1)
         if ohlcv and len(ohlcv) > 0:
             # [timestamp, open, high, low, close, volume]
             return float(ohlcv[0][1])  # open price
@@ -329,9 +351,11 @@ def get_binance_btc_price_at(ts_ms: int) -> float | None:
 
 # "BTC Up or Down - April 13, 4:00 AM ET"
 # "Bitcoin 5 Minute Up or Down - 10:30 AM ET"
-# "Bitcoin Up or Down on April 14?"
+# "Ethereum Up or Down - April 22, 9:00 AM ET"
+# "SOL Up or Down - April 22, 10:00 AM ET"
+_COIN_NAMES = r"(?:BTC|Bitcoin|ETH|Ethereum|SOL|Solana)"
 UP_DOWN_PATTERN = re.compile(
-    r"(?:BTC|Bitcoin)\s+(?:(\d+)\s*(?:Minute|Min)\s+)?Up\s+(?:or|and)\s+Down",
+    _COIN_NAMES + r"\s+(?:(\d+)\s*(?:Minute|Min)\s+)?Up\s+(?:or|and)\s+Down",
     re.IGNORECASE,
 )
 
@@ -501,7 +525,7 @@ def parse_strike(question: str) -> tuple[float, str] | None:
         return None
 
     # Reject implausibly low strikes (volatility=70, dominance=60%, etc.)
-    if strike < MIN_BTC_STRIKE:
+    if strike < MIN_STRIKE:
         return None
 
     dir_match = DIRECTION_PATTERN.search(question)
@@ -565,12 +589,13 @@ async def fetch_crypto_markets(
             for m in markets[:15]:
                 print(f"    [{m.category}] {m.question[:70]}")
 
-    # Parse strike prices (BTC only for now)
+    _coin_keywords = re.compile(
+        r"\b(btc|bitcoin|eth|ethereum|sol|solana)\b", re.IGNORECASE
+    )
     crypto: list[tuple[Market, float, str]] = []
     skipped_dead = 0
     for m in markets:
-        q = m.question.lower()
-        if "btc" not in q and "bitcoin" not in q:
+        if not _coin_keywords.search(m.question):
             continue
         if m.volume == 0 and m.liquidity == 0:
             skipped_dead += 1
@@ -580,7 +605,10 @@ async def fetch_crypto_markets(
             crypto.append((m, parsed[0], parsed[1]))
 
     # "Up or Down" markets (no strike, direction-only)
-    up_down_pattern = re.compile(r"(?:BTC|Bitcoin)\s+Up or Down", re.IGNORECASE)
+    up_down_pattern = re.compile(
+        _COIN_NAMES + r"\s+(?:\d+\s*(?:Minute|Min)\s+)?Up\s+(?:or|and)\s+Down",
+        re.IGNORECASE,
+    )
     seen_ids = {c[0].market_id for c in crypto}
     for m in markets:
         if up_down_pattern.search(m.question) and m.market_id not in seen_ids:
@@ -600,25 +628,26 @@ async def fetch_crypto_markets(
 # ---------------------------------------------------------------------------
 
 
-async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
-    """Run one scan cycle: fetch Binance price + Polymarket odds, compare."""
+async def scan_once(*, verbose: bool = False) -> tuple[list[ArbSignal], dict[str, float]]:
+    """Run one scan cycle. Returns (signals, prices)."""
 
-    # 1. Binance price
+    # 1. Binance prices (BTC, ETH, SOL)
     t0 = time.time()
-    btc_price = get_binance_btc_price()
+    prices = get_binance_prices()
     binance_ms = (time.time() - t0) * 1000
-    print(f"  Binance BTC/USDT: ${btc_price:,.2f} ({binance_ms:.0f}ms)")
+    price_str = "  ".join(f"{c}=${p:,.2f}" for c, p in prices.items())
+    print(f"  Binance: {price_str} ({binance_ms:.0f}ms)")
 
     # 2. Polymarket crypto markets
     async with PolymarketClient() as client:
         t0 = time.time()
         raw_markets = await fetch_crypto_markets(client, verbose=verbose)
         poly_ms = (time.time() - t0) * 1000
-        print(f"  Polymarket BTC markets: {len(raw_markets)} found ({poly_ms:.0f}ms)")
+        print(f"  Polymarket crypto markets: {len(raw_markets)} found ({poly_ms:.0f}ms)")
 
         if not raw_markets:
-            print("  No BTC price-target markets found on Polymarket.")
-            return []
+            print("  No crypto markets found on Polymarket.")
+            return [], prices
 
         # 3. Pre-filter: only fetch orderbooks for active Up/Down windows
         actionable: list[tuple[Market, float, str]] = []
@@ -669,6 +698,7 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                 market=m,
                 strike_price=strike,
                 direction=direction,
+                coin=detect_coin(m.question),
                 yes_ask=yes_ask,
                 no_ask=no_ask,
                 yes_bid=yes_bid,
@@ -708,6 +738,9 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
     for cm in sorted(crypto_markets, key=lambda c: c.strike_price):
         strike = cm.strike_price
         direction = cm.direction
+        coin_price = prices.get(cm.coin)
+        if coin_price is None:
+            continue
         hte = cm.hours_to_expiry
 
         if direction == "up_or_down":
@@ -735,9 +768,9 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                     print(f"  UD  SKIP (expired)  '{cm.market.question[:50]}'")
                 continue
 
-            # Fetch the BTC open price for this window
+            # Fetch the open price for this window
             window_start_ms = int(ud_info.window_start_utc.timestamp() * 1000)
-            open_price = get_binance_btc_price_at(window_start_ms)
+            open_price = get_binance_price_at(cm.coin, window_start_ms)
             ud_info.open_price = open_price
 
             if open_price is None or open_price <= 0:
@@ -745,13 +778,13 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                     print(f"  UD  SKIP (no open price)  '{cm.market.question[:50]}'")
                 continue
 
-            # Calculate BTC movement from open
-            btc_move_pct = (btc_price - open_price) / open_price * 100
+            # Calculate price movement from open
+            btc_move_pct = (coin_price - open_price) / open_price * 100
             minutes_left = ud_info.window_minutes - ud_info.minutes_elapsed
 
             if verbose:
                 print(f"  UD  {ud_info.window_minutes}min  "
-                      f"open=${open_price:,.0f}  now=${btc_price:,.0f}  "
+                      f"open=${open_price:,.0f}  now=${coin_price:,.0f}  "
                       f"move={btc_move_pct:+.3f}%  "
                       f"{ud_info.minutes_elapsed:.1f}m in / {minutes_left:.1f}m left  "
                       f"YES={cm.yes_ask:.3f} NO={cm.no_ask:.3f}  "
@@ -802,14 +835,14 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                         edge = fair_winner - cm.yes_ask
                         signals.append(ArbSignal(
                             crypto_market=cm,
-                            binance_price=btc_price,
+                            binance_price=coin_price,
                             fair_value=(f"YES ~{fair_winner:.0%} [{confidence}, {window_label}, "
-                                        f"BTC +{btc_move_pct:.3f}% from open, "
+                                        f"{cm.coin} +{btc_move_pct:.3f}% from open, "
                                         f"{minutes_left:.0f}m left]"),
                             poly_yes_ask=cm.yes_ask,
                             poly_no_ask=cm.no_ask,
                             edge_description=(f"buy YES @ {cm.yes_ask:.3f}, "
-                                              f"BTC ${btc_price:,.0f} up from open ${open_price:,.0f}"),
+                                              f"{cm.coin} ${coin_price:,.0f} up from open ${open_price:,.0f}"),
                             edge_pct=edge * 100,
                         ))
                 else:
@@ -819,14 +852,14 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
                         edge = fair_winner - cm.no_ask
                         signals.append(ArbSignal(
                             crypto_market=cm,
-                            binance_price=btc_price,
+                            binance_price=coin_price,
                             fair_value=(f"NO ~{fair_winner:.0%} [{confidence}, {window_label}, "
-                                        f"BTC {btc_move_pct:.3f}% from open, "
+                                        f"{cm.coin} {btc_move_pct:.3f}% from open, "
                                         f"{minutes_left:.0f}m left]"),
                             poly_yes_ask=cm.yes_ask,
                             poly_no_ask=cm.no_ask,
                             edge_description=(f"buy NO @ {cm.no_ask:.3f}, "
-                                              f"BTC ${btc_price:,.0f} down from open ${open_price:,.0f}"),
+                                              f"{cm.coin} ${coin_price:,.0f} down from open ${open_price:,.0f}"),
                             edge_pct=edge * 100,
                         ))
 
@@ -874,52 +907,50 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
             confidence = "MEDIUM"
 
         if direction == "above":
-            distance_pct = (btc_price - strike) / strike * 100
+            distance_pct = (coin_price - strike) / strike * 100
         else:
-            distance_pct = (strike - btc_price) / strike * 100
+            distance_pct = (strike - coin_price) / strike * 100
 
         hte_str = f"{hte:.1f}h" if hte is not None else "??h"
 
         if verbose:
-            above_strike = btc_price > strike if direction == "above" else btc_price < strike
+            above_strike = coin_price > strike if direction == "above" else coin_price < strike
             tag = ">>>" if above_strike else "   "
             print(f"  {tag} ${strike:>10,.0f} {direction:>5}  "
                   f"YES={cm.yes_ask:.3f} NO={cm.no_ask:.3f}  "
-                  f"BTC dist={distance_pct:+.2f}%  exp={hte_str}  "
+                  f"{cm.coin} dist={distance_pct:+.2f}%  exp={hte_str}  "
                   f"'{cm.market.question[:45]}'")
 
         # Check for mispricings
         if direction == "above":
-            if btc_price > strike * (1 + distance_threshold):
-                # BTC above strike → YES should be high
+            if coin_price > strike * (1 + distance_threshold):
                 if (cm.yes_ask < fair_value_est and cm.yes_ask > 0
                         and cm.yes_ask_size >= MIN_SIGNAL_SIZE):
                     edge = fair_value_est - cm.yes_ask
                     signals.append(ArbSignal(
                         crypto_market=cm,
-                        binance_price=btc_price,
+                        binance_price=coin_price,
                         fair_value=f"YES ~{fair_value_est:.0%} [{confidence}, exp={hte_str}]",
                         poly_yes_ask=cm.yes_ask,
                         poly_no_ask=cm.no_ask,
-                        edge_description=f"buy YES @ {cm.yes_ask:.3f}, BTC ${btc_price:,.0f} > strike ${strike:,.0f}",
+                        edge_description=f"buy YES @ {cm.yes_ask:.3f}, {cm.coin} ${coin_price:,.0f} > strike ${strike:,.0f}",
                         edge_pct=edge * 100,
                     ))
-            elif btc_price < strike * (1 - distance_threshold):
-                # BTC below strike → NO should be high
+            elif coin_price < strike * (1 - distance_threshold):
                 if (cm.no_ask < fair_value_est and cm.no_ask > 0
                         and cm.no_ask_size >= MIN_SIGNAL_SIZE):
                     edge = fair_value_est - cm.no_ask
                     signals.append(ArbSignal(
                         crypto_market=cm,
-                        binance_price=btc_price,
+                        binance_price=coin_price,
                         fair_value=f"NO ~{fair_value_est:.0%} [{confidence}, exp={hte_str}]",
                         poly_yes_ask=cm.yes_ask,
                         poly_no_ask=cm.no_ask,
-                        edge_description=f"buy NO @ {cm.no_ask:.3f}, BTC ${btc_price:,.0f} < strike ${strike:,.0f}",
+                        edge_description=f"buy NO @ {cm.no_ask:.3f}, {cm.coin} ${coin_price:,.0f} < strike ${strike:,.0f}",
                         edge_pct=edge * 100,
                     ))
 
-    return signals
+    return signals, prices
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1016,7 @@ def log_signal(signal: ArbSignal) -> None:
     line = (
         f"[{ts}] {tag} EDGE={signal.edge_pct:+.1f}% | "
         f"exp={exp_str} | "
-        f"BTC=${signal.binance_price:,.0f} | "
+        f"{cm.coin}=${signal.binance_price:,.0f} | "
         f"{signal.edge_description} | "
         f"sz_yes={cm.yes_ask_size:.0f} sz_no={cm.no_ask_size:.0f} | "
         f"{cm.market.question[:60]} | "
@@ -999,12 +1030,13 @@ def log_signal(signal: ArbSignal) -> None:
         pass  # don't crash the scanner if file write fails
 
 
-def print_report(signals: list[ArbSignal], btc_price: float,
+def print_report(signals: list[ArbSignal], prices: dict[str, float],
                  live_executor=None) -> None:
     """Print scan results. If live_executor is set, execute trades immediately."""
     ts = _wib_now()
+    price_str = "  ".join(f"{c}=${p:,.0f}" for c, p in prices.items())
     print(f"\n{'=' * 70}")
-    print(f"CRYPTO ARB SCAN — BTC=${btc_price:,.2f} — {ts}")
+    print(f"CRYPTO ARB SCAN — {price_str} — {ts}")
     print(f"{'=' * 70}")
 
     if not signals:
@@ -1059,11 +1091,10 @@ async def run_loop(interval: float, verbose: bool,
             print(f"[{ts_wib} WIB / {ts_utc} UTC] Cycle {cycle}")
 
             try:
-                signals = await scan_once(verbose=verbose)
+                signals, prices_snap = await scan_once(verbose=verbose)
                 if signals:
                     total_signals += len(signals)
-                    btc_price = signals[0].binance_price
-                    print_report(signals, btc_price,
+                    print_report(signals, prices_snap,
                                  live_executor=live_executor)
                 else:
                     if verbose:
@@ -1086,12 +1117,11 @@ async def run_loop(interval: float, verbose: bool,
 
 async def run_once(verbose: bool) -> int:
     """Single scan."""
-    print("Crypto arb scan: Polymarket BTC vs Binance\n")
+    print("Crypto arb scan: Polymarket vs Binance\n")
 
     try:
-        signals = await scan_once(verbose=verbose)
-        btc_price = get_binance_btc_price()
-        print_report(signals, btc_price)
+        signals, prices_snap = await scan_once(verbose=verbose)
+        print_report(signals, prices_snap)
         return 0
     except (PolymarketError, ccxt.BaseError) as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
