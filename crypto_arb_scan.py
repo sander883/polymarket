@@ -620,26 +620,21 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
             print("  No BTC price-target markets found on Polymarket.")
             return []
 
-        # 3. Pre-filter: only fetch orderbooks for actionable markets
-        #    Up/Down near-expiry + strike markets ≤6h
+        # 3. Pre-filter: only fetch orderbooks for active Up/Down windows
         actionable: list[tuple[Market, float, str]] = []
         skipped_prefilter = 0
         for m, strike, direction in raw_markets:
-            if direction == "up_or_down":
-                ud = parse_up_down(m.question)
-                if ud is None:
-                    skipped_prefilter += 1
-                    continue
-                if ud.minutes_elapsed < 0 or ud.minutes_elapsed > ud.window_minutes:
-                    skipped_prefilter += 1
-                    continue
-                actionable.append((m, strike, direction))
-            else:
-                hte = hours_to_expiry(m.question)
-                if hte is not None and 0 < hte <= 6:
-                    actionable.append((m, strike, direction))
-                else:
-                    skipped_prefilter += 1
+            if direction != "up_or_down":
+                skipped_prefilter += 1
+                continue
+            ud = parse_up_down(m.question)
+            if ud is None:
+                skipped_prefilter += 1
+                continue
+            if ud.minutes_elapsed < 0 or ud.minutes_elapsed > ud.window_minutes:
+                skipped_prefilter += 1
+                continue
+            actionable.append((m, strike, direction))
 
         token_ids = []
         for m, _, _ in actionable:
