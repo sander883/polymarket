@@ -39,7 +39,7 @@ WIB = timezone(timedelta(hours=7))
 # ---------------------------------------------------------------------------
 
 MAX_WINDOW_MINUTES = 60          # 5m, 15m, 60m Up/Down markets
-MAX_MINUTES_LEFT = 1.0           # only trade when <1min left (near-certain outcome)
+MAX_MINUTES_LEFT = 2.0           # <2min left, immediate execution preserves edge
 MIN_EDGE_PCT = 10.0              # lowered: immediate execution preserves edge better
 MIN_ACT_SIZE = 20                # $5 @ 0.69 = ~7 shares, 20 cukup
 MIN_PRICE = 0.20                 # stale orders di bawah ini kemungkinan phantom
