@@ -293,10 +293,12 @@ class ArbSignal:
 # ---------------------------------------------------------------------------
 
 
+_binance = ccxt.binance({"enableRateLimit": True})
+
+
 def get_binance_btc_price() -> float:
     """Fetch current BTC/USDT price from Binance via ccxt (REST)."""
-    exchange = ccxt.binance({"enableRateLimit": True})
-    ticker = exchange.fetch_ticker("BTC/USDT")
+    ticker = _binance.fetch_ticker("BTC/USDT")
     return float(ticker["last"])
 
 
@@ -307,9 +309,7 @@ def get_binance_btc_price_at(ts_ms: int) -> float | None:
     This is the reference price for Up/Down market resolution.
     """
     try:
-        exchange = ccxt.binance({"enableRateLimit": True})
-        # fetch 1 candle starting at the given timestamp
-        ohlcv = exchange.fetch_ohlcv("BTC/USDT", "1m", since=ts_ms, limit=1)
+        ohlcv = _binance.fetch_ohlcv("BTC/USDT", "1m", since=ts_ms, limit=1)
         if ohlcv and len(ohlcv) > 0:
             # [timestamp, open, high, low, close, volume]
             return float(ohlcv[0][1])  # open price
@@ -620,22 +620,43 @@ async def scan_once(*, verbose: bool = False) -> list[ArbSignal]:
             print("  No BTC price-target markets found on Polymarket.")
             return []
 
-        # 3. Fetch orderbooks
+        # 3. Pre-filter: only fetch orderbooks for actionable markets
+        #    Up/Down near-expiry + strike markets ≤6h
+        actionable: list[tuple[Market, float, str]] = []
+        skipped_prefilter = 0
+        for m, strike, direction in raw_markets:
+            if direction == "up_or_down":
+                ud = parse_up_down(m.question)
+                if ud is None:
+                    skipped_prefilter += 1
+                    continue
+                if ud.minutes_elapsed < 0 or ud.minutes_elapsed > ud.window_minutes:
+                    skipped_prefilter += 1
+                    continue
+                actionable.append((m, strike, direction))
+            else:
+                hte = hours_to_expiry(m.question)
+                if hte is not None and 0 < hte <= 6:
+                    actionable.append((m, strike, direction))
+                else:
+                    skipped_prefilter += 1
+
         token_ids = []
-        for m, _, _ in raw_markets:
+        for m, _, _ in actionable:
             if m.yes_token_id:
                 token_ids.append(m.yes_token_id)
             if m.no_token_id:
                 token_ids.append(m.no_token_id)
 
         t0 = time.time()
-        books = await client.get_orderbooks(token_ids)
+        books = await client.get_orderbooks(token_ids) if token_ids else {}
         book_ms = (time.time() - t0) * 1000
-        print(f"  Orderbooks fetched: {len(books)} ({book_ms:.0f}ms)")
+        print(f"  Orderbooks fetched: {len(books)} of {len(raw_markets)} "
+              f"({skipped_prefilter} pre-filtered) ({book_ms:.0f}ms)")
 
     # 4. Build CryptoMarket objects
     crypto_markets: list[CryptoMarket] = []
-    for m, strike, direction in raw_markets:
+    for m, strike, direction in actionable:
         yes_book = books.get(m.yes_token_id) if m.yes_token_id else None
         no_book = books.get(m.no_token_id) if m.no_token_id else None
 
